@@ -22,7 +22,7 @@ jobs:
             toolchain_pkg: unzip xz-utils
             toolchain_url: https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
             toolchain_archive: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
-            toolchain_dir: ${{ github.workspace }}/.ci/toolchains/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu/bin
+            toolchain_root: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu
           - chip: ax630c
             script: ./build_ax630c.sh
             msp_zip: msp_20e_3.0.0.zip
@@ -30,7 +30,7 @@ jobs:
             toolchain_pkg: unzip xz-utils
             toolchain_url: https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
             toolchain_archive: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
-            toolchain_dir: ${{ github.workspace }}/.ci/toolchains/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu/bin
+            toolchain_root: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu
           - chip: ax620qp
             script: ./build_ax620qp.sh
             msp_zip: msp_20e_3.0.0.zip
@@ -38,7 +38,7 @@ jobs:
             toolchain_pkg: unzip xz-utils
             toolchain_url: https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/arm-linux-gnueabihf/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf.tar.xz
             toolchain_archive: gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf.tar.xz
-            toolchain_dir: ${{ github.workspace }}/.ci/toolchains/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin
+            toolchain_root: gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf
           - chip: ax620q
             script: ./build_ax620q.sh
             msp_zip: msp_20e_3.0.0.zip
@@ -46,7 +46,7 @@ jobs:
             toolchain_pkg: unzip
             toolchain_url: https://github.com/AXERA-TECH/ax620q_bsp_sdk/releases/download/v2.0.0/arm-AX620E-linux-uclibcgnueabihf_V3_20240320.tgz
             toolchain_archive: arm-AX620E-linux-uclibcgnueabihf_V3_20240320.tgz
-            toolchain_dir: ${{ github.workspace }}/.ci/toolchains/arm-AX620E-linux-uclibcgnueabihf/bin
+            toolchain_root: arm-AX620E-linux-uclibcgnueabihf
 
     steps:
       - uses: actions/checkout@v4
@@ -83,15 +83,18 @@ jobs:
         env:
           TOOLCHAIN_URL: ${{ matrix.toolchain_url }}
           TOOLCHAIN_ARCHIVE: ${{ matrix.toolchain_archive }}
+          TOOLCHAIN_ROOT: ${{ matrix.toolchain_root }}
         run: |
-          mkdir -p "${{ github.workspace }}/.ci/toolchains"
-          if [ ! -f "${{ github.workspace }}/.ci/toolchains/$TOOLCHAIN_ARCHIVE" ]; then
-            curl -L "$TOOLCHAIN_URL" -o "${{ github.workspace }}/.ci/toolchains/$TOOLCHAIN_ARCHIVE"
+          TOOLCHAIN_BASE="${{ github.workspace }}/.ci/toolchains"
+          TOOLCHAIN_BIN_DIR="$TOOLCHAIN_BASE/$TOOLCHAIN_ROOT/bin"
+          mkdir -p "$TOOLCHAIN_BASE"
+          if [ ! -f "$TOOLCHAIN_BASE/$TOOLCHAIN_ARCHIVE" ]; then
+            curl -L "$TOOLCHAIN_URL" -o "$TOOLCHAIN_BASE/$TOOLCHAIN_ARCHIVE"
           fi
-          if [ ! -d "${{ matrix.toolchain_dir }}" ]; then
+          if [ ! -d "$TOOLCHAIN_BIN_DIR" ]; then
             case "$TOOLCHAIN_ARCHIVE" in
               *.tar.xz|*.tgz|*.tar.gz)
-                tar -xf "${{ github.workspace }}/.ci/toolchains/$TOOLCHAIN_ARCHIVE" -C "${{ github.workspace }}/.ci/toolchains"
+                tar -xf "$TOOLCHAIN_BASE/$TOOLCHAIN_ARCHIVE" -C "$TOOLCHAIN_BASE"
                 ;;
               *)
                 echo "unsupported toolchain archive: $TOOLCHAIN_ARCHIVE" >&2
@@ -99,11 +102,12 @@ jobs:
                 ;;
             esac
           fi
+          test -x "$TOOLCHAIN_BIN_DIR" || test -d "$TOOLCHAIN_BIN_DIR"
 
       - name: Build
         env:
           AXSDK_MSP_ZIP_PATH: ${{ github.workspace }}/.ci/downloads/${{ matrix.msp_zip }}
-          AXSDK_TOOLCHAIN_BIN: ${{ matrix.toolchain_dir }}
+          AXSDK_TOOLCHAIN_BIN: ${{ github.workspace }}/.ci/toolchains/${{ matrix.toolchain_root }}/bin
         run: |
           chmod +x ./build_ax650.sh ./build_ax630c.sh ./build_ax620q.sh ./build_ax620qp.sh ./scripts/build_common.sh
           ${{ matrix.script }}
