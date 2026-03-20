@@ -23,7 +23,9 @@ namespace axvsdk::codec {
 
 namespace {
 
-constexpr std::array<std::uint8_t, 4> kAnnexBStartCode{0x00, 0x00, 0x00, 0x01};
+// Some AX VDEC paths are picky about the start code length for AnnexB streams.
+// 0x000001 is valid for both AVC/HEVC AnnexB and is widely accepted.
+constexpr std::array<std::uint8_t, 3> kAnnexBStartCode{0x00, 0x00, 0x01};
 
 struct NalUnitView {
     const std::uint8_t* data{nullptr};

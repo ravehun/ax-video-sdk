@@ -1,5 +1,6 @@
 #include "ax_video_decoder_internal.h"
 
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -23,6 +24,12 @@ constexpr AX_U32 kStreamAlignment = 0x100;
 constexpr AX_U32 kPoolMetaSize = 512;
 constexpr AX_U32 kVdecWidthAlign = 16;
 constexpr AX_U32 kFrameBufferCount = 8;
+constexpr AX_U32 kFrameBufferCountH264 = 32;
+// NOTE:
+// 20e VDEC can be sensitive to being fed too fast from file sources (MP4 demux).
+// We apply a conservative rate limit based on the packet duration (if available).
+constexpr std::uint64_t kMinSubmitIntervalUs = 1000;  // 1ms
+constexpr std::uint64_t kSubmitSpeedupFactor = 2;     // allow up to ~2x real-time by default
 
 AX_U32 AlignUp(AX_U32 value, AX_U32 alignment) noexcept {
     if (alignment == 0) {
@@ -40,13 +47,12 @@ AX_U32 ResolvePoolHeight(const Mp4VideoInfo& video_info) noexcept {
 }
 
 AX_U32 ResolveGroupWidth(const Mp4VideoInfo& video_info) noexcept {
-    (void)video_info;
-    return AX_VDEC_MAX_WIDTH;
+    // pic size should be the coded/display size (not macroblock-aligned). Padding goes to u32FrameHeight.
+    return video_info.width == 0 ? AX_VDEC_MAX_WIDTH : video_info.width;
 }
 
 AX_U32 ResolveGroupHeight(const Mp4VideoInfo& video_info) noexcept {
-    (void)video_info;
-    return AX_VDEC_MAX_HEIGHT;
+    return video_info.height == 0 ? AX_VDEC_MAX_HEIGHT : video_info.height;
 }
 
 std::mutex& GroupMutex() {
@@ -106,6 +112,11 @@ public:
     }
 
 protected:
+    struct StreamBuffer {
+        AX_U64 phy{0};
+        AX_U8* vir{nullptr};
+    };
+
     bool CreateFramePool(AX_PAYLOAD_TYPE_E payload, const Mp4VideoInfo& video_info, AX_U32 frame_buffer_count) {
         if (group_ < 0) {
             return false;
@@ -159,16 +170,18 @@ protected:
         AX_VDEC_GRP_ATTR_T group_attr{};
         const AX_U32 group_width = ResolveGroupWidth(video_info);
         const AX_U32 group_height = ResolveGroupHeight(video_info);
+        const AX_U32 frame_height = video_info.height == 0 ? AX_VDEC_MAX_HEIGHT : AlignUp(video_info.height, 16U);
         group_attr.enCodecType = payload;
-        group_attr.enInputMode = AX_VDEC_INPUT_MODE_FRAME;
+        group_attr.enInputMode = AX_VDEC_INPUT_MODE_COMPAT;
+        // We use AX_VDEC_GetFrame to fetch decoded frames; keep VDEC in unlink mode (same as MSP samples).
         group_attr.enLinkMode = AX_UNLINK_MODE;
         group_attr.enOutOrder = AX_VDEC_OUTPUT_ORDER_DISP;
         group_attr.u32PicWidth = group_width;
         group_attr.u32PicHeight = group_height;
-        group_attr.u32FrameHeight = 0;
+        group_attr.u32FrameHeight = frame_height;
         group_attr.u32StreamBufSize = ResolveStreamBufferSize(video_info);
         group_attr.enVdecVbSource = AX_POOL_SOURCE_USER;
-        group_attr.u32FrameBufCnt = kFrameBufferCount;
+        group_attr.u32FrameBufCnt = video_info.codec == VideoCodecType::kH264 ? kFrameBufferCountH264 : kFrameBufferCount;
         group_attr.s32DestroyTimeout = 0;
 
         group_ = AcquireGroupId();
@@ -203,15 +216,32 @@ protected:
         }
 
         stream_buffer_size_ = group_attr.u32StreamBufSize;
+        // IMPORTANT:
+        // 20e samples pace AX_VDEC_SendStream and reuse a CMM stream buffer. Empirically, if we overwrite the same
+        // buffer too quickly (offline MP4), VDEC may read corrupted data and stop early.
+        // Keep this small to reduce CMM usage; stability is primarily ensured by rate limiting + backpressure.
+        const AX_U32 stream_buf_count = 8;
+        stream_buffers_.clear();
+        stream_buffers_.reserve(stream_buf_count);
+        stream_buffer_index_ = 0;
+        submitted_frames_.store(0, std::memory_order_relaxed);
+        received_frames_.store(0, std::memory_order_relaxed);
+        next_submit_due_ = {};
+
         const auto* token = reinterpret_cast<const AX_S8*>("VdecInputStream");
-        const auto mem_ret =
-            AX_SYS_MemAlloc(&stream_phy_addr_, reinterpret_cast<AX_VOID**>(&stream_vir_addr_), stream_buffer_size_,
-                            kStreamAlignment, token);
-        if (mem_ret != AX_SUCCESS) {
-            std::fprintf(stderr, "ax620e CreateBackend: AX_SYS_MemAlloc size=%u ret=0x%x\n", stream_buffer_size_,
-                         mem_ret);
-            DestroyBackend();
-            return false;
+        for (AX_U32 i = 0; i < stream_buf_count; ++i) {
+            StreamBuffer buf{};
+            const auto mem_ret =
+                AX_SYS_MemAlloc(&buf.phy, reinterpret_cast<AX_VOID**>(&buf.vir), stream_buffer_size_, kStreamAlignment,
+                                token);
+            if (mem_ret != AX_SUCCESS || buf.phy == 0 || buf.vir == nullptr) {
+                std::fprintf(stderr, "ax620e CreateBackend: AX_SYS_MemAlloc[%u/%u] size=%u ret=0x%x phy=0x%llx\n",
+                             i, stream_buf_count, stream_buffer_size_, mem_ret,
+                             static_cast<unsigned long long>(buf.phy));
+                DestroyBackend();
+                return false;
+            }
+            stream_buffers_.push_back(buf);
         }
 
         return true;
@@ -220,12 +250,19 @@ protected:
     void DestroyBackend() noexcept override {
         StopBackend();
 
-        if (stream_phy_addr_ != 0 && stream_vir_addr_ != nullptr) {
-            (void)AX_SYS_MemFree(stream_phy_addr_, stream_vir_addr_);
+        for (auto& buf : stream_buffers_) {
+            if (buf.phy != 0 && buf.vir != nullptr) {
+                (void)AX_SYS_MemFree(buf.phy, buf.vir);
+            }
+            buf.phy = 0;
+            buf.vir = nullptr;
         }
-        stream_phy_addr_ = 0;
-        stream_vir_addr_ = nullptr;
+        stream_buffers_.clear();
+        stream_buffer_index_ = 0;
         stream_buffer_size_ = 0;
+        submitted_frames_.store(0, std::memory_order_relaxed);
+        received_frames_.store(0, std::memory_order_relaxed);
+        next_submit_due_ = {};
 
         if (group_ >= 0) {
             if (frame_pool_attached_) {
@@ -261,7 +298,8 @@ protected:
         AX_VDEC_GRP_PARAM_T group_param{};
         group_param.enVdecMode = VIDEO_DEC_MODE_IPB;
         (void)AX_VDEC_SetGrpParam(group_, &group_param);
-        if (AX_VDEC_SetDisplayMode(group_, AX_VDEC_DISPLAY_MODE_PLAYBACK) != AX_SUCCESS) {
+        // Follow 20e sample default (preview) to avoid firmware-specific playback timing behavior.
+        if (AX_VDEC_SetDisplayMode(group_, AX_VDEC_DISPLAY_MODE_PREVIEW) != AX_SUCCESS) {
             return false;
         }
 
@@ -279,17 +317,33 @@ protected:
     }
 
     bool SendEncodedPacket(const EncodedPacket& packet) override {
-        if (group_ < 0 || stream_vir_addr_ == nullptr || packet.data.empty() || packet.data.size() > stream_buffer_size_) {
-            if (packet.data.size() > stream_buffer_size_) {
-                std::fprintf(stderr,
-                             "ax620e SendEncodedPacket: packet too large size=%zu stream_buf=%u pts=%llu key=%d\n",
-                             packet.data.size(), stream_buffer_size_, static_cast<unsigned long long>(packet.pts),
-                             packet.key_frame ? 1 : 0);
-            }
+        if (group_ < 0 || packet.data.empty() || stream_buffers_.empty()) {
             return false;
         }
 
-        std::memcpy(stream_vir_addr_, packet.data.data(), packet.data.size());
+        if (packet.duration > 0 && kSubmitSpeedupFactor > 0) {
+            const auto interval_us =
+                std::max<std::uint64_t>(kMinSubmitIntervalUs, packet.duration / kSubmitSpeedupFactor);
+            const auto interval = std::chrono::microseconds(interval_us);
+            const auto now = std::chrono::steady_clock::now();
+            if (next_submit_due_.time_since_epoch().count() == 0) {
+                next_submit_due_ = now;
+            }
+            if (now < next_submit_due_) {
+                std::this_thread::sleep_for(next_submit_due_ - now);
+            }
+            const auto now2 = std::chrono::steady_clock::now();
+            next_submit_due_ = (next_submit_due_ > now2 ? next_submit_due_ : now2) + interval;
+        }
+
+        if (packet.data.size() > stream_buffer_size_) {
+            std::fprintf(stderr, "ax620e SendEncodedPacket: packet too large: %zu > stream_buf=%u\n",
+                         packet.data.size(), stream_buffer_size_);
+            return false;
+        }
+
+        auto& buf = stream_buffers_[stream_buffer_index_ % stream_buffers_.size()];
+        std::memcpy(buf.vir, packet.data.data(), packet.data.size());
 
         AX_VDEC_STREAM_T stream{};
         stream.u64PTS = packet.pts;
@@ -297,13 +351,13 @@ protected:
         stream.bEndOfStream = AX_FALSE;
         stream.bSkipDisplay = AX_FALSE;
         stream.u32StreamPackLen = static_cast<AX_U32>(packet.data.size());
-        stream.pu8Addr = stream_vir_addr_;
-        stream.u64PhyAddr = 0;
+        stream.pu8Addr = buf.vir;
+        stream.u64PhyAddr = buf.phy;
 
         while (!stop_requested()) {
             const auto ret = AX_VDEC_SendStream(group_, &stream, kAxWaitMs);
             if (ret == AX_SUCCESS) {
-                return true;
+                break;
             }
             if (ret != AX_ERR_VDEC_BUF_FULL && ret != AX_ERR_VDEC_QUEUE_FULL) {
                 std::fprintf(stderr,
@@ -315,7 +369,22 @@ protected:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        return false;
+        stream_buffer_index_ = (stream_buffer_index_ + 1) % stream_buffers_.size();
+        submitted_frames_.fetch_add(1, std::memory_order_relaxed);
+
+        // Backpressure: do not allow the submitter to outrun the decoder indefinitely.
+        // This makes "offline" MP4 ingestion stable on 20e even when realtime_playback=false.
+        while (!stop_requested()) {
+            const auto submitted = submitted_frames_.load(std::memory_order_relaxed);
+            const auto received = received_frames_.load(std::memory_order_relaxed);
+            const auto inflight = submitted > received ? (submitted - received) : 0;
+            if (inflight < stream_buffers_.size()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        return !stop_requested();
     }
 
     bool SendEndOfStream() override {
@@ -323,9 +392,28 @@ protected:
             return false;
         }
 
+        // Give VDEC a chance to drain queued access units before signaling EOS.
+        // Without this, some 20e firmware versions may stop early for file sources that are fed too fast.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!stop_requested()) {
+            const auto submitted = submitted_frames_.load(std::memory_order_relaxed);
+            const auto received = received_frames_.load(std::memory_order_relaxed);
+            if (received >= submitted) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
         AX_VDEC_STREAM_T stream{};
         stream.bEndOfFrame = AX_TRUE;
         stream.bEndOfStream = AX_TRUE;
+        // Matches 20e samples: EOS is sent with no payload.
+        stream.pu8Addr = nullptr;
+        stream.u32StreamPackLen = 0;
+        stream.u64PhyAddr = 0;
         const auto ret = AX_VDEC_SendStream(group_, &stream, kAxWaitMs);
         if (ret != AX_SUCCESS && ret != AX_ERR_VDEC_FLOW_END) {
             std::fprintf(stderr, "ax620e SendEndOfStream: AX_VDEC_SendStream grp=%d ret=0x%x\n", group_, ret);
@@ -341,6 +429,7 @@ protected:
         *flow_end = false;
         const auto ret = AX_VDEC_GetFrame(group_, frame_info, kAxWaitMs);
         if (ret == AX_SUCCESS) {
+            received_frames_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         if (ret == AX_ERR_VDEC_FLOW_END) {
@@ -364,10 +453,13 @@ private:
     AX_VDEC_GRP group_{-1};
     AX_POOL frame_pool_{AX_INVALID_POOLID};
     bool frame_pool_attached_{false};
-    AX_U64 stream_phy_addr_{0};
-    AX_U8* stream_vir_addr_{nullptr};
+    std::vector<StreamBuffer> stream_buffers_{};
+    std::size_t stream_buffer_index_{0};
     AX_U32 stream_buffer_size_{0};
     bool started_{false};
+    std::atomic<std::uint64_t> submitted_frames_{0};
+    std::atomic<std::uint64_t> received_frames_{0};
+    std::chrono::steady_clock::time_point next_submit_due_{};
 };
 
 }  // namespace

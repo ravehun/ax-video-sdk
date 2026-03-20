@@ -338,8 +338,18 @@ void AxVideoDecoderBase::PublishFrame(const AX_VIDEO_FRAME_INFO_T& frame_info) {
 #endif
         const auto ref_ret = AX_POOL_IncreaseRefCnt(block_id);
         if (ref_ret == AX_SUCCESS) {
+            // Some decoders return padded heights (e.g. 1088 for 1080p H.264).
+            // Expose the logical stream dimensions to callers while keeping the underlying buffer untouched.
+            AX_VIDEO_FRAME_INFO_T normalized = frame_info;
+            if (config_.stream.width != 0 && normalized.stVFrame.u32Width > config_.stream.width) {
+                normalized.stVFrame.u32Width = config_.stream.width;
+            }
+            if (config_.stream.height != 0 && normalized.stVFrame.u32Height > config_.stream.height) {
+                normalized.stVFrame.u32Height = config_.stream.height;
+            }
+
             published_frame = common::internal::AxImageAccess::WrapVideoFrame(
-                frame_info, [](const AX_VIDEO_FRAME_INFO_T& retained_frame) {
+                normalized, [](const AX_VIDEO_FRAME_INFO_T& retained_frame) {
                     if (retained_frame.stVFrame.u32BlkId[0] != AX_INVALID_BLOCKID) {
 #if defined(AXSDK_PLATFORM_AXCL)
                         if (!common::internal::EnsureAxclThreadContext()) {

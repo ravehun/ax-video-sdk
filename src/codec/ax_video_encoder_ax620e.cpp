@@ -158,6 +158,9 @@ protected:
 
         const auto& frame_info = common::internal::AxImageAccess::GetAxFrameInfo(frame);
         const auto ret = AX_VENC_SendFrame(channel_, &frame_info, kAxWaitMs);
+        if (ret != AX_SUCCESS && ret != AX_ERR_VENC_BUF_FULL && ret != AX_ERR_VENC_QUEUE_FULL) {
+            std::fprintf(stderr, "ax620e venc: AX_VENC_SendFrame chn=%d ret=0x%x\n", channel_, ret);
+        }
         return ret == AX_SUCCESS;
     }
 

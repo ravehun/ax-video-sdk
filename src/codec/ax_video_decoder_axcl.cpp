@@ -18,6 +18,8 @@ namespace {
 constexpr AX_S32 kAxWaitMs = 100;
 constexpr AX_VDEC_CHN kOutputChannel = 0;
 constexpr AX_U32 kFrameBufferCount = 8;
+constexpr AX_U32 kFrameBufferCountH264 = 32;
+constexpr std::size_t kMaxStreamChunkBytes = 256U * 1024U;
 
 AX_PAYLOAD_TYPE_E ToAxPayload(VideoCodecType codec) noexcept {
     switch (codec) {
@@ -41,6 +43,10 @@ AX_U32 ResolveFrameStride(AX_U32 width) noexcept {
     return ((width + 255U) / 256U) * 256U;
 }
 
+AX_U32 AlignToMacroblock(AX_U32 value) noexcept {
+    return ((value + 15U) / 16U) * 16U;
+}
+
 class AxclVideoDecoder final : public AxVideoDecoderBase {
 public:
     ~AxclVideoDecoder() override {
@@ -57,11 +63,15 @@ protected:
             return false;
         }
 
+        const AX_U32 aligned_width = AlignToMacroblock(video_info.width);
+        const AX_U32 aligned_height = AlignToMacroblock(video_info.height);
+        const AX_U32 frame_buffer_count = video_info.codec == VideoCodecType::kH264 ? kFrameBufferCountH264 : kFrameBufferCount;
+
         AX_VDEC_GRP_ATTR_T group_attr{};
         group_attr.enCodecType = payload;
         group_attr.enInputMode = AX_VDEC_INPUT_MODE_FRAME;
-        group_attr.u32MaxPicWidth = video_info.width;
-        group_attr.u32MaxPicHeight = video_info.height;
+        group_attr.u32MaxPicWidth = aligned_width;
+        group_attr.u32MaxPicHeight = aligned_height;
         group_attr.u32StreamBufSize = ResolveStreamBufferSize(video_info);
         group_attr.bSdkAutoFramePool = AX_TRUE;
 
@@ -81,11 +91,11 @@ protected:
         }
 
         AX_VDEC_CHN_ATTR_T channel_attr{};
-        channel_attr.u32PicWidth = video_info.width;
-        channel_attr.u32PicHeight = video_info.height;
-        channel_attr.u32FrameStride = ResolveFrameStride(video_info.width);
+        channel_attr.u32PicWidth = aligned_width;
+        channel_attr.u32PicHeight = aligned_height;
+        channel_attr.u32FrameStride = ResolveFrameStride(aligned_width);
         channel_attr.u32OutputFifoDepth = 3;
-        channel_attr.u32FrameBufCnt = kFrameBufferCount;
+        channel_attr.u32FrameBufCnt = frame_buffer_count;
         channel_attr.enOutputMode = AX_VDEC_OUTPUT_ORIGINAL;
         channel_attr.enImgFormat = AX_FORMAT_YUV420_SEMIPLANAR;
         channel_attr.stCompressInfo.enCompressMode = AX_COMPRESS_MODE_NONE;
@@ -151,26 +161,38 @@ protected:
             return false;
         }
 
-        AX_VDEC_STREAM_T stream{};
-        stream.u64PTS = packet.pts;
-        stream.bEndOfFrame = AX_TRUE;
-        stream.bEndOfStream = AX_FALSE;
-        stream.bSkipDisplay = AX_FALSE;
-        stream.u32StreamPackLen = static_cast<AX_U32>(packet.data.size());
-        stream.pu8Addr = const_cast<AX_U8*>(packet.data.data());
+        std::size_t offset = 0;
+        while (!stop_requested() && offset < packet.data.size()) {
+            const std::size_t remaining = packet.data.size() - offset;
+            const std::size_t chunk = std::min<std::size_t>(remaining, kMaxStreamChunkBytes);
 
-        while (!stop_requested()) {
-            const auto ret = AXCL_VDEC_SendStream(group_, &stream, kAxWaitMs);
-            if (ret == AX_SUCCESS) {
-                return true;
+            AX_VDEC_STREAM_T stream{};
+            stream.u64PTS = packet.pts;
+            stream.bEndOfFrame = (offset + chunk) >= packet.data.size() ? AX_TRUE : AX_FALSE;
+            stream.bEndOfStream = AX_FALSE;
+            stream.bSkipDisplay = AX_FALSE;
+            stream.u32StreamPackLen = static_cast<AX_U32>(chunk);
+            stream.pu8Addr = const_cast<AX_U8*>(packet.data.data() + offset);
+
+            while (!stop_requested()) {
+                const auto ret = AXCL_VDEC_SendStream(group_, &stream, kAxWaitMs);
+                if (ret == AX_SUCCESS) {
+                    break;
+                }
+                if (ret != AX_ERR_VDEC_BUF_FULL && ret != AX_ERR_VDEC_QUEUE_FULL) {
+                    std::fprintf(stderr,
+                                 "axcl SendEncodedPacket: AXCL_VDEC_SendStream grp=%d ret=0x%x pts=%llu len=%u eof=%d\n",
+                                 group_, ret, static_cast<unsigned long long>(stream.u64PTS), stream.u32StreamPackLen,
+                                 stream.bEndOfFrame);
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            if (ret != AX_ERR_VDEC_BUF_FULL && ret != AX_ERR_VDEC_QUEUE_FULL) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+            offset += chunk;
         }
 
-        return false;
+        return offset >= packet.data.size() && !stop_requested();
     }
 
     bool SendEndOfStream() override {
