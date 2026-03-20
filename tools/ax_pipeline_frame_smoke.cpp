@@ -1,4 +1,5 @@
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -7,8 +8,10 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "ax_cmdline_utils.h"
+#include "ax_image_copy.h"
 #include "common/ax_image.h"
 #include "common/ax_system.h"
 #include "pipeline/ax_pipeline.h"
@@ -16,6 +19,48 @@
 namespace {
 
 using namespace axvsdk;
+
+struct HostImageStorage {
+    std::array<std::vector<std::uint8_t>, common::kMaxImagePlanes> planes;
+};
+
+common::AxImage::Ptr CreateHostImage(common::ImageDescriptor descriptor) {
+    auto storage = std::make_shared<HostImageStorage>();
+    std::array<common::ExternalImagePlane, common::kMaxImagePlanes> planes{};
+
+    const std::size_t plane_count =
+        descriptor.format == common::PixelFormat::kNv12 ? 2U :
+        descriptor.format == common::PixelFormat::kRgb24 || descriptor.format == common::PixelFormat::kBgr24 ? 1U : 0U;
+    if (plane_count == 0) {
+        return nullptr;
+    }
+
+    for (std::size_t plane = 0; plane < plane_count; ++plane) {
+        if (descriptor.strides[plane] == 0) {
+            switch (descriptor.format) {
+            case common::PixelFormat::kNv12:
+                descriptor.strides[plane] = descriptor.width;
+                break;
+            case common::PixelFormat::kRgb24:
+            case common::PixelFormat::kBgr24:
+                descriptor.strides[plane] = static_cast<std::size_t>(descriptor.width) * 3U;
+                break;
+            case common::PixelFormat::kUnknown:
+            default:
+                return nullptr;
+            }
+        }
+        const std::size_t rows =
+            descriptor.format == common::PixelFormat::kNv12 && plane == 1 ? descriptor.height / 2U : descriptor.height;
+        const std::size_t plane_size = descriptor.strides[plane] * rows;
+        storage->planes[plane].resize(plane_size);
+        planes[plane].virtual_address = storage->planes[plane].data();
+        planes[plane].physical_address = 0;
+        planes[plane].block_id = common::kInvalidPoolId;
+    }
+
+    return common::AxImage::WrapExternal(descriptor, planes, storage);
+}
 
 std::size_t PlaneCount(common::PixelFormat format) noexcept {
     switch (format) {
@@ -84,8 +129,9 @@ std::uint64_t Checksum(const common::AxImage& image) {
     return checksum;
 }
 
-int Run(const char* input_path, const char* output_path, int expected_frames, int timeout_seconds) {
+int Run(const char* input_path, const char* output_path, int expected_frames, int timeout_seconds, int device_id) {
     common::SystemOptions system_options{};
+    system_options.device_id = device_id;
     system_options.enable_vdec = true;
     system_options.enable_venc = true;
     system_options.enable_ivps = true;
@@ -114,6 +160,7 @@ int Run(const char* input_path, const char* output_path, int expected_frames, in
     std::atomic<int> callback_packets{0};
 
     pipeline::PipelineConfig config{};
+    config.device_id = device_id;
     config.input.uri = input_path;
     config.input.realtime_playback = false;
     config.frame_output.output_image.format = common::PixelFormat::kBgr24;
@@ -140,10 +187,14 @@ int Run(const char* input_path, const char* output_path, int expected_frames, in
         if (!frame) {
             return;
         }
+        auto host_frame = CreateHostImage(frame->descriptor());
+        if (!host_frame || !common::internal::CopyImage(*frame, host_frame.get())) {
+            return;
+        }
         callback_width.store(static_cast<int>(frame->width()), std::memory_order_relaxed);
         callback_height.store(static_cast<int>(frame->height()), std::memory_order_relaxed);
         callback_format.store(static_cast<int>(frame->format()), std::memory_order_relaxed);
-        callback_checksum.store(Checksum(*frame), std::memory_order_relaxed);
+        callback_checksum.store(Checksum(*host_frame), std::memory_order_relaxed);
         callback_frames.fetch_add(1, std::memory_order_relaxed);
     });
 
@@ -160,12 +211,26 @@ int Run(const char* input_path, const char* output_path, int expected_frames, in
         std::cerr << "user output alloc failed\n";
         return 6;
     }
+    auto user_host_output = CreateHostImage(user_output->descriptor());
+    if (!user_host_output) {
+        pipeline->Stop();
+        pipeline->Close();
+        std::cerr << "user host output alloc failed\n";
+        return 6;
+    }
 
     std::atomic<int> latest_hits{0};
     std::atomic<int> latest_width{0};
     std::atomic<int> latest_height{0};
     std::atomic<int> latest_format{0};
     std::atomic<std::uint64_t> latest_checksum{0};
+    auto latest_host_output = CreateHostImage(config.frame_output.output_image);
+    if (!latest_host_output) {
+        pipeline->Stop();
+        pipeline->Close();
+        std::cerr << "latest host output alloc failed\n";
+        return 6;
+    }
 
     std::atomic<int> user_hits{0};
     std::atomic<std::uint64_t> user_checksum{0};
@@ -177,12 +242,15 @@ int Run(const char* input_path, const char* output_path, int expected_frames, in
             latest_width.store(static_cast<int>(latest->width()), std::memory_order_relaxed);
             latest_height.store(static_cast<int>(latest->height()), std::memory_order_relaxed);
             latest_format.store(static_cast<int>(latest->format()), std::memory_order_relaxed);
-            latest_checksum.store(Checksum(*latest), std::memory_order_relaxed);
-            latest_hits.fetch_add(1, std::memory_order_relaxed);
+            if (common::internal::CopyImage(*latest, latest_host_output.get())) {
+                latest_checksum.store(Checksum(*latest_host_output), std::memory_order_relaxed);
+                latest_hits.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
-        if (pipeline->GetLatestFrame(*user_output)) {
-            user_checksum.store(Checksum(*user_output), std::memory_order_relaxed);
+        if (pipeline->GetLatestFrame(*user_output) &&
+            common::internal::CopyImage(*user_output, user_host_output.get())) {
+            user_checksum.store(Checksum(*user_host_output), std::memory_order_relaxed);
             user_hits.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -259,6 +327,7 @@ int main(int argc, char** argv) {
     parser.add<std::string>("output", 'o', "output URI/path", false, "");
     parser.add<int>("expected-frames", 'n', "expected frame callbacks", false, 10);
     parser.add<int>("timeout", 't', "timeout seconds", false, 25);
+    parser.add<int>("device-id", 'd', "AX device index", false, -1);
 
     const auto cli_result = tooling::ParseCommandLine(parser, argc, argv);
     if (cli_result != tooling::CliParseResult::kOk) {
@@ -269,13 +338,15 @@ int main(int argc, char** argv) {
     std::string output_uri;
     int expected_frames = 10;
     int timeout_seconds = 25;
+    int device_id = -1;
     if (!tooling::GetRequiredArgument(parser, "input", 0, "input", &input_uri, std::cerr) ||
         !tooling::GetRequiredArgument(parser, "output", 1, "output", &output_uri, std::cerr) ||
         !tooling::GetOptionalArgument(parser, "expected-frames", 2, 10, &expected_frames, std::cerr) ||
-        !tooling::GetOptionalArgument(parser, "timeout", 3, 25, &timeout_seconds, std::cerr)) {
+        !tooling::GetOptionalArgument(parser, "timeout", 3, 25, &timeout_seconds, std::cerr) ||
+        !tooling::GetOptionalArgument(parser, "device-id", 4, -1, &device_id, std::cerr)) {
         std::cerr << parser.usage();
         return 1;
     }
 
-    return Run(input_uri.c_str(), output_uri.c_str(), expected_frames, timeout_seconds);
+    return Run(input_uri.c_str(), output_uri.c_str(), expected_frames, timeout_seconds, device_id);
 }

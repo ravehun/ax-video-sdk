@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "axcl_ivps.h"
+#include "axcl_rt_device.h"
 
 #include "ax_image_copy.h"
 #include "ax_image_internal.h"
@@ -221,7 +222,7 @@ public:
             return false;
         }
 
-        return destination.InvalidateCache();
+        return destination.InvalidateCache() && axclrtSynchronizeDevice() == AXCL_SUCC;
     }
 };
 

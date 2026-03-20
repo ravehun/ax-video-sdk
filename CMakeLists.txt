@@ -304,12 +304,18 @@ if(AXSDK_BUILD_SMOKE_TESTS)
     add_executable(ax_pipeline_frame_smoke
         tools/ax_pipeline_frame_smoke.cpp
     )
-    axsdk_configure_internal_tool(ax_pipeline_frame_smoke)
+    axsdk_configure_internal_tool(ax_pipeline_frame_smoke
+        LINK_AX_MSP
+        EXTRA_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    )
 
     add_executable(ax_pipeline_osd_smoke
         tools/ax_pipeline_osd_smoke.cpp
     )
-    axsdk_configure_internal_tool(ax_pipeline_osd_smoke)
+    axsdk_configure_internal_tool(ax_pipeline_osd_smoke
+        LINK_AX_MSP
+        EXTRA_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    )
 
     add_executable(ax_pipeline_stress_smoke
         tools/ax_pipeline_stress_smoke.cpp

@@ -15,8 +15,15 @@ enum class DemuxerInputType {
 };
 
 struct DemuxerConfig {
+    // 输入 URI。
+    // 当前主要支持 MP4 文件路径和 RTSP 拉流地址。
     std::string uri;
+    // MP4 输入时：
+    // true 表示按源视频帧率节奏送包，适合模拟实时源；
+    // false 表示尽快读取，适合离线转码。
+    // RTSP 输入下通常按实时流行为工作。
     bool realtime_playback{true};
+    // 仅对可复位文件型输入生效，例如 MP4。
     bool loop_playback{false};
 };
 

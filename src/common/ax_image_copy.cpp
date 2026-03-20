@@ -6,6 +6,7 @@
 
 #if defined(AXSDK_PLATFORM_AXCL)
 #include "axcl_ivps.h"
+#include "axcl_rt_device.h"
 #include "axcl_rt_memory.h"
 #define AX_IVPS_CmmCopyVpp AXCL_IVPS_CmmCopyVpp
 #define AX_IVPS_CscVpp AXCL_IVPS_CscVpp
@@ -20,6 +21,12 @@
 namespace axvsdk::common::internal {
 
 namespace {
+
+#if defined(AXSDK_PLATFORM_AXCL)
+bool SynchronizeAxclDevice() noexcept {
+    return EnsureAxclThreadContext() && axclrtSynchronizeDevice() == AXCL_SUCC;
+}
+#endif
 
 PixelFormat FromAxFormat(AX_IMG_FORMAT_E format) noexcept {
     switch (format) {
@@ -238,7 +245,14 @@ bool CopyImageImpl(const ImageDescriptor& source_descriptor,
         }
 
         if (ivps_copy_ok) {
-            return destination->InvalidateCache();
+            if (!destination->InvalidateCache()) {
+                return false;
+            }
+#if defined(AXSDK_PLATFORM_AXCL)
+            return SynchronizeAxclDevice();
+#else
+            return true;
+#endif
         }
 
         if (CopyFrameByCsc(*source_frame, destination)) {
@@ -264,7 +278,14 @@ bool CopyImageImpl(const ImageDescriptor& source_descriptor,
         }
 
         if (ivps_copy_ok) {
-            return destination->InvalidateCache();
+            if (!destination->InvalidateCache()) {
+                return false;
+            }
+#if defined(AXSDK_PLATFORM_AXCL)
+            return SynchronizeAxclDevice();
+#else
+            return true;
+#endif
         }
     }
 
@@ -296,7 +317,14 @@ bool CopyImageImpl(const ImageDescriptor& source_descriptor,
                        PlaneRows(source_descriptor, plane), PlaneRowBytes(source_descriptor, plane));
     }
 
-    return destination->FlushCache();
+    if (!destination->FlushCache()) {
+        return false;
+    }
+#if defined(AXSDK_PLATFORM_AXCL)
+    return SynchronizeAxclDevice();
+#else
+    return true;
+#endif
 }
 
 }  // namespace

@@ -5,13 +5,15 @@
 当前项目重点面向以下芯片：
 
 - `AX650`
-- `AX630C`
-- `AX620Q`
-- `AX620QP`
+- `AX620E`
+  - `AX630C`
+  - `AX620Q`
+  - `AX620QP`
+- `AXCL`
 
 其中：
 
-- `AX650` 和 `AX620E/630C/620Q/620QP` 分开实现、分开维护
+- `AX650` 和 `AX620E(630C/620Q/620QP)` 和 `AXCL` 分开实现、分开维护
 - 公共对外头文件尽量不直接暴露 MSP 头文件
 - 最终交付以单个 SDK 动态库为主
 
@@ -62,17 +64,24 @@
 
 ## 本地构建
 
-### 1. 准备 MSP 压缩包
+### 1. 准备 MSP / AXCL SDK 压缩包
 
-默认构建脚本会从仓库根目录下的 `.ci/downloads/` 查找 MSP 压缩包：
+默认构建脚本会从仓库根目录下的 `.ci/downloads/` 查找对应平台所需的 SDK 压缩包：
 
 - `msp_50_3.10.2.zip`
 - `msp_20e_3.0.0.zip`
+- `axcl_linux_3.10.2.zip`
 
 也可以通过环境变量覆盖：
 
 ```bash
 export AXSDK_MSP_ZIP_PATH=/path/to/msp_20e_3.0.0.zip
+```
+
+AXCL 也支持直接使用本机已安装目录：
+
+```bash
+export AXSDK_AXCL_DIR=/usr
 ```
 
 ### 2. 准备交叉编译器
@@ -95,12 +104,14 @@ export AXSDK_TOOLCHAIN_BIN=/path/to/toolchain/bin
 
 ### 3. 运行构建脚本
 
-仓库根目录提供了四个脚本：
+仓库根目录提供了六个脚本：
 
 - [build_ax650.sh](/home/axera/ax_video_sdk/build_ax650.sh)
 - [build_ax630c.sh](/home/axera/ax_video_sdk/build_ax630c.sh)
 - [build_ax620q.sh](/home/axera/ax_video_sdk/build_ax620q.sh)
 - [build_ax620qp.sh](/home/axera/ax_video_sdk/build_ax620qp.sh)
+- [build_axcl_x86.sh](/home/axera/ax_video_sdk/build_axcl_x86.sh)
+- [build_axcl_aarch64.sh](/home/axera/ax_video_sdk/build_axcl_aarch64.sh)
 
 示例：
 
@@ -109,6 +120,8 @@ export AXSDK_TOOLCHAIN_BIN=/path/to/toolchain/bin
 ./build_ax630c.sh
 ./build_ax620q.sh
 ./build_ax620qp.sh
+./build_axcl_x86.sh
+./build_axcl_aarch64.sh
 ```
 
 ### 4. 构建产物
@@ -126,6 +139,8 @@ export AXSDK_TOOLCHAIN_BIN=/path/to/toolchain/bin
 - `artifacts/ax630c/ax_video_sdk_ax630c.tar.gz`
 - `artifacts/ax620q/ax_video_sdk_ax620q.tar.gz`
 - `artifacts/ax620qp/ax_video_sdk_ax620qp.tar.gz`
+- `artifacts/axcl-x86_64/ax_video_sdk_axcl-x86_64.tar.gz`
+- `artifacts/axcl-aarch64/ax_video_sdk_axcl-aarch64.tar.gz`
 
 压缩包中包含：
 
@@ -142,9 +157,10 @@ export AXSDK_TOOLCHAIN_BIN=/path/to/toolchain/bin
 CI 会自动：
 
 - 下载 MSP 压缩包
+- 下载 AXCL SDK 压缩包
 - 下载对应交叉编译器
 - 解压到工作目录下 `.ci/`
-- 调用四个 `build_*.sh`
+- 调用六个 `build_*.sh`
 - 上传每个平台的 SDK 打包产物
 
 为了避免重复下载，CI 对以下目录做了缓存：
@@ -152,6 +168,7 @@ CI 会自动：
 - `.ci/downloads`
 - `.ci/toolchains`
 - `.ci/msp`
+- `.ci/axcl`
 
 ## 当前状态
 
@@ -166,13 +183,22 @@ CI 会自动：
 
 已知边界：
 
-- AX620E 当前按 `H.264 decode only` 处理
+- `AX630C / AX620Q / AX620QP` 当前都按 `H.264 decode only` 处理，不支持 H.265 decode
+- `AX620Q / AX620QP` 的解码能力依赖驱动；若板子上没有 `/soc/ko/ax_vdec.ko`，则用户需要先自行安装对应驱动，否则解码不可用
 - 跨进程双路测试目前不应作为有效容量测试
 - AX620E 系列不按高并发多路设计，现实目标以 `1~2 路 1080p` 为主
 
-### AX650
+### AXCL
 
-AX650 功能更完整，能力上限也更高，但正式的统一测试归档仍需继续补齐。
+- AXCL 后端当前支持单进程多卡，`Pipeline` 级别固定单卡
+- 视频编解码、JPEG 编解码、图像处理、frame output 已打通
+- AXCL 下 `GetLatestFrame` / frame callback 返回的默认是设备侧图像；如需访问 host 内存，需要显式拷贝到 host
+
+已知边界：
+
+- AXCL 当前的 OSD 仅支持 `rect`
+- `line / polygon / mosaic / bitmap` 这些绘图类型在 AXCL 上暂未开放，原因是运行时稳定性不足，当前版本会直接拒绝
+- AXCL 下应避免并行运行多个测试进程，否则容易受到 PCIe/runtime 干扰
 
 ## 说明
 

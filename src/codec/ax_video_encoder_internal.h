@@ -25,11 +25,13 @@ struct ResolvedVideoEncoderConfig {
     std::size_t input_queue_depth{10};
     QueueOverflowPolicy overflow_policy{QueueOverflowPolicy::kDropOldest};
     std::size_t stream_buffer_size{0};
+    common::ResizeOptions resize{};
 };
 
 struct PreparedInputFrame {
     common::AxImage::Ptr frame;
     bool reusable{false};
+    bool hold_for_inflight{false};
 };
 
 class AxVideoEncoderBase : public VideoEncoder {
@@ -92,6 +94,7 @@ private:
     std::mutex staging_mutex_;
     std::deque<common::AxImage::Ptr> reusable_frames_;
     std::deque<common::AxImage::Ptr> inflight_frames_;
+    std::deque<common::AxImage::Ptr> inflight_hold_frames_;
 };
 
 std::unique_ptr<VideoEncoder> CreatePlatformVideoEncoder();

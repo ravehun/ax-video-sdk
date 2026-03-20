@@ -123,6 +123,11 @@ protected:
     }
 
     void DestroyBackend() noexcept override {
+        if (!common::internal::EnsureAxclThreadContext(config().device_id)) {
+            channel_ = -1;
+            started_ = false;
+            return;
+        }
         StopBackend();
         if (channel_ >= 0) {
             for (int retry = 0; retry < 10; ++retry) {
@@ -152,6 +157,10 @@ protected:
     }
 
     void StopBackend() noexcept override {
+        if (!common::internal::EnsureAxclThreadContext(config().device_id)) {
+            started_ = false;
+            return;
+        }
         if (channel_ >= 0 && started_) {
             (void)AXCL_VENC_StopRecvFrame(channel_);
             (void)AXCL_VENC_ResetChn(channel_);

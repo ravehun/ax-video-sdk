@@ -20,6 +20,11 @@
 #include "common/ax_image.h"
 #include "common/ax_image_processor.h"
 
+#if defined(AXSDK_PLATFORM_AXCL)
+#include "axcl_rt_device.h"
+#include "ax_system_internal.h"
+#endif
+
 namespace axvsdk::pipeline {
 
 namespace {
@@ -181,7 +186,6 @@ public:
 
         std::vector<OutputBranch> branches;
         branches.reserve(config.outputs.size());
-        bool needs_branch_processing = false;
         const double input_frame_rate = input_stream.frame_rate > 0.0 ? input_stream.frame_rate : 30.0;
         for (const auto& output : config.outputs) {
             if (output.uris.empty() && !output.packet_callback) {
@@ -267,34 +271,9 @@ public:
                 });
             }
 
-            common::ImageProcessRequest process_request{};
-            process_request.output_image.format = common::PixelFormat::kNv12;
-            process_request.output_image.width = encoder_config.width;
-            process_request.output_image.height = encoder_config.height;
-            process_request.resize = output.resize;
+            encoder_config.resize = output.resize;
 
-            const bool branch_needs_processing =
-                encoder_config.width != input_stream.width || encoder_config.height != input_stream.height;
-            needs_branch_processing = needs_branch_processing || branch_needs_processing;
-
-            branches.push_back(
-                OutputBranch{output, std::move(encoder), std::move(muxer), process_request, branch_needs_processing});
-        }
-
-        if (needs_branch_processing) {
-            branch_processor_ = common::CreateImageProcessor();
-            if (!branch_processor_) {
-                decoder->Close();
-                for (auto& branch : branches) {
-                    if (branch.muxer) {
-                        branch.muxer->Close();
-                    }
-                    branch.encoder->Close();
-                }
-                return false;
-            }
-        } else {
-            branch_processor_.reset();
+            branches.push_back(OutputBranch{output, std::move(encoder), std::move(muxer)});
         }
 
         {
@@ -356,7 +335,6 @@ public:
             branch.encoder->Close();
         }
         branches_.clear();
-        branch_processor_.reset();
         {
             std::lock_guard<std::mutex> frame_lock(frame_mutex_);
             latest_source_frame_.reset();
@@ -443,6 +421,21 @@ public:
         }
         if (demux_thread_.joinable()) {
             demux_thread_.join();
+        }
+
+        {
+            std::lock_guard<std::mutex> osd_lock(osd_mutex_);
+            pending_osd_.reset();
+            active_osd_.reset();
+            active_osd_remaining_frames_ = 0;
+        }
+        {
+            std::lock_guard<std::mutex> frame_lock(frame_mutex_);
+            latest_source_frame_.reset();
+        }
+        {
+            std::lock_guard<std::mutex> callback_lock(frame_callback_mutex_);
+            pending_callback_source_frame_.reset();
         }
 
         for (auto& branch : branches_) {
@@ -543,8 +536,6 @@ private:
         PipelineOutputConfig config{};
         std::unique_ptr<codec::VideoEncoder> encoder;
         std::unique_ptr<Muxer> muxer;
-        common::ImageProcessRequest process_request{};
-        bool needs_processing{false};
     };
 
     void StopFrameCallbackThread() noexcept {
@@ -609,9 +600,9 @@ private:
         active_osd_remaining_frames_ = active_osd_->hold_frames();
     }
 
-    void ApplyOsdIfNeeded(common::AxImage::Ptr* frame) {
+    bool ApplyOsdIfNeeded(common::AxImage::Ptr* frame) {
         if (frame == nullptr || !*frame) {
-            return;
+            return false;
         }
 
         std::shared_ptr<const common::PreparedDrawCommands> osd_to_apply;
@@ -619,7 +610,7 @@ private:
             std::lock_guard<std::mutex> lock(osd_mutex_);
             ApplyPendingOsdUpdateLocked();
             if (!active_osd_) {
-                return;
+                return false;
             }
 
             osd_to_apply = active_osd_;
@@ -634,15 +625,23 @@ private:
         auto osd_frame = CreateOutputImage((*frame)->descriptor());
         if (!osd_frame || !common::internal::CopyImage(**frame, osd_frame.get())) {
             std::fprintf(stderr, "pipeline osd: copy frame failed\n");
-            return;
+            return false;
         }
 
         if (!osd_to_apply->Apply(*osd_frame)) {
             std::fprintf(stderr, "pipeline osd: apply failed\n");
-            return;
+            return false;
         }
 
+#if defined(AXSDK_PLATFORM_AXCL)
+        if (!common::internal::EnsureAxclThreadContext(config_.device_id) || axclrtSynchronizeDevice() != AXCL_SUCC) {
+            std::fprintf(stderr, "pipeline osd: synchronize failed\n");
+            return false;
+        }
+#endif
+
         *frame = std::move(osd_frame);
+        return true;
     }
 
     void DemuxLoop() {
@@ -708,7 +707,8 @@ private:
             return;
         }
 
-        ApplyOsdIfNeeded(&frame);
+        (void)ApplyOsdIfNeeded(&frame);
+        common::AxImage::Ptr encoder_frame = frame;
 
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -724,16 +724,7 @@ private:
         }
 
         for (auto& branch : branches_) {
-            common::AxImage::Ptr frame_for_branch = frame;
-            if (branch.needs_processing) {
-                if (!branch_processor_) {
-                    branch_submit_failures_.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-                frame_for_branch = branch_processor_->Process(*frame, branch.process_request);
-            }
-
-            if (!frame_for_branch || !branch.encoder->SubmitFrame(std::move(frame_for_branch))) {
+            if (!branch.encoder->SubmitFrame(encoder_frame)) {
                 branch_submit_failures_.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -742,7 +733,6 @@ private:
     PipelineConfig config_{};
     std::unique_ptr<Demuxer> demuxer_;
     std::unique_ptr<codec::VideoDecoder> decoder_;
-    std::unique_ptr<common::ImageProcessor> branch_processor_;
     std::vector<OutputBranch> branches_;
     std::atomic<bool> open_{false};
     std::atomic<bool> running_{false};

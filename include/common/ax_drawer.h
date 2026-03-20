@@ -14,13 +14,16 @@ struct DrawPoint {
 };
 
 struct DrawLine {
+    // 至少 2 个点。
     std::vector<DrawPoint> points;
     std::uint16_t thickness{2};
     std::uint8_t alpha{255};
+    // 颜色按 0xRRGGBB 传入。
     std::uint32_t color{0xFF0000};
 };
 
 struct DrawPolygon {
+    // 至少 3 个点。
     std::vector<DrawPoint> points;
     std::uint16_t thickness{2};
     std::uint8_t alpha{255};
@@ -35,8 +38,10 @@ struct DrawRect {
     std::uint32_t height{0};
     std::uint16_t thickness{2};
     std::uint8_t alpha{255};
+    // 颜色按 0xRRGGBB 传入。
     std::uint32_t color{0xFF0000};
     bool filled{false};
+    // true 时绘制角框。
     bool corner_only{false};
     std::uint16_t corner_horizontal_length{0};
     std::uint16_t corner_vertical_length{0};
@@ -83,10 +88,14 @@ struct DrawBitmap {
     bool color_invert{false};
     std::uint32_t color_invert_value{0};
     std::uint32_t color_invert_threshold{0};
+    // 原始位图数据，布局由 format 决定。
     std::vector<std::uint8_t> data;
 };
 
 struct DrawFrame {
+    // OSD 保留帧数。
+    // 1 表示仅作用于接下来的一帧。
+    // 0 表示持续生效，直到被新的 OSD 覆盖或显式 ClearOsd。
     std::uint32_t hold_frames{1};
     std::vector<DrawLine> lines;
     std::vector<DrawPolygon> polygons;

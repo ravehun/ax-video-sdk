@@ -14,31 +14,46 @@
 
 namespace axvsdk::pipeline {
 
+// pipeline 输入由 URI 自动识别，通常无需调用方手工指定类型。
 using PipelineInputConfig = DemuxerConfig;
 
 struct PipelineOutputConfig {
     codec::VideoCodecType codec{codec::VideoCodecType::kH264};
+    // 传 0 表示默认跟随输入视频尺寸。
     std::uint32_t width{0};
     std::uint32_t height{0};
+    // 传 0 表示默认跟随输入帧率。
     double frame_rate{0.0};
+    // 传 0 表示内部按分辨率和编码类型自动估算目标码率。
     std::uint32_t bitrate_kbps{0};
+    // 传 0 表示内部按输出帧率自动估算。
     std::uint32_t gop{0};
+    // 传 0 表示使用 encoder 内部默认队列深度。
     std::size_t input_queue_depth{0};
     codec::QueueOverflowPolicy overflow_policy{codec::QueueOverflowPolicy::kDropOldest};
+    // 输出尺寸与输入不一致时，送入编码器前的 resize 策略。
     common::ResizeOptions resize{};
+    // 可同时配置多个目标，例如 MP4 文件和 RTSP 推流地址。
     std::vector<std::string> uris;
+    // 额外的 host 侧编码包回调。默认 nullptr。
     codec::PacketCallback packet_callback{};
 };
 
 struct PipelineFrameOutputConfig {
+    // GetLatestFrame / frame callback 的输出图像描述。
+    // format/width/height 为空时默认跟随解码原图，通常为 NV12。
     common::ImageDescriptor output_image{};
+    // frame output 的缩放策略。
     common::ResizeOptions resize{};
 };
 
 struct PipelineConfig {
+    // AXCL 下建议显式指定 device_id；同一个 Pipeline 只绑定一张卡。
     std::int32_t device_id{-1};
     PipelineInputConfig input{};
+    // 允许 1 路输入对应 N 路输出。
     std::vector<PipelineOutputConfig> outputs;
+    // 控制对外 latest frame / frame callback 的输出格式和尺寸。
     PipelineFrameOutputConfig frame_output{};
 };
 
@@ -59,9 +74,18 @@ public:
     virtual bool Start() = 0;
     virtual void Stop() noexcept = 0;
 
+    // 返回值版本：
+    // 返回当前“最新一帧”语义的图像。
+    // 默认按 frame_output 配置生成；若未配置，通常返回 NV12 解码原图尺寸。
     virtual common::AxImage::Ptr GetLatestFrame() = 0;
+    // 出参版本：
+    // 调用方自己准备输出图像，pipeline 负责填充。
     virtual bool GetLatestFrame(common::AxImage& output_image) = 0;
+    // 设置 frame callback。
+    // 只有注册回调时，pipeline 才会为回调额外准备输出图像。
     virtual void SetFrameCallback(FrameCallback callback) = 0;
+    // 设置异步 OSD。
+    // 当前 AXCL 后端仅支持 rect；其余平台能力以各自实现为准。
     virtual bool SetOsd(const common::DrawFrame& osd) = 0;
     virtual void ClearOsd() noexcept = 0;
 
