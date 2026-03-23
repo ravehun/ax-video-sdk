@@ -2,7 +2,9 @@
 #include "ax_system_internal.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -173,7 +175,22 @@ bool InitializeSystem(const SystemOptions& options) {
 
 #if defined(AXSDK_PLATFORM_AXCL)
     if (!state.axcl_initialized) {
-        const auto ret = axclInit(nullptr);
+        // AXCL official samples call axclInit(json_path). Some environments ship a default config under
+        // /usr/bin/axcl/axcl.json. Keep nullptr as fallback for older installs.
+        const char* config_path = std::getenv("AXCL_JSON");
+        if (config_path == nullptr || config_path[0] == '\0') {
+            config_path = std::getenv("AXCL_CONFIG");
+        }
+        if (config_path == nullptr || config_path[0] == '\0') {
+            static constexpr const char* kDefaultAxclJson = "/usr/bin/axcl/axcl.json";
+            if (std::ifstream(kDefaultAxclJson).good()) {
+                config_path = kDefaultAxclJson;
+            } else {
+                config_path = nullptr;
+            }
+        }
+
+        const auto ret = axclInit(config_path);
         if (ret != AXCL_SUCC) {
             std::cerr << "axclInit failed, ret=0x" << std::hex << ret << std::dec << "\n";
             return false;
@@ -453,6 +470,11 @@ bool EnsureAxclThreadContext(int device_id) noexcept {
     }
 
     if (thread_context.context != nullptr && thread_context.device_id == resolved_device_id) {
+        // Avoid spamming context bind logs when already current.
+        axclrtContext current = nullptr;
+        if (axclrtGetCurrentContext(&current) == AXCL_SUCC && current == thread_context.context) {
+            return true;
+        }
         (void)axclrtSetCurrentContext(thread_context.context);
         return true;
     }

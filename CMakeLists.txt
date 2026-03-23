@@ -274,11 +274,13 @@ if(AXSDK_BUILD_SMOKE_TESTS)
     )
     axsdk_configure_internal_tool(ax_image_processor_dump)
 
-    add_executable(ax_system_probe
-        tools/ax_system_probe.cpp
-    )
-    # This tool calls AX_* symbols directly, so it must link the MSP libs explicitly.
-    axsdk_configure_internal_tool(ax_system_probe LINK_AX_MSP EXTRA_LIBRARIES ${AXSDK_COMMON_LIBS})
+    if(NOT AXSDK_CHIP_TYPE_NORMALIZED STREQUAL "axcl")
+        add_executable(ax_system_probe
+            tools/ax_system_probe.cpp
+        )
+        # This tool calls AX_* symbols directly (MSP APIs), so it is only meaningful on SoCs.
+        axsdk_configure_internal_tool(ax_system_probe LINK_AX_MSP EXTRA_LIBRARIES ${AXSDK_COMMON_LIBS})
+    endif()
 
     add_executable(ax_jpeg_smoke
         tools/ax_jpeg_smoke.cpp
