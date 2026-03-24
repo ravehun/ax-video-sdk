@@ -412,8 +412,13 @@ bool AxMp4Demuxer::ReadNextPacket(EncodedPacket* packet) {
     if (pts_ts < 0) {
         pts_ts = 0;
     }
-    packet->pts = static_cast<std::uint64_t>(pts_ts);
-    packet->duration = duration;
+    const auto timescale = impl_->video_info.timescale;
+    if (timescale == 0) {
+        return false;
+    }
+    // Normalize to microseconds for downstream VDEC/VENC logic.
+    packet->pts = (static_cast<std::uint64_t>(pts_ts) * 1000000ULL) / timescale;
+    packet->duration = (static_cast<std::uint64_t>(duration) * 1000000ULL) / timescale;
     packet->key_frame = key_frame;
     packet->data.clear();
 
@@ -443,6 +448,56 @@ namespace axvsdk::codec::internal {
 
 namespace {
 
+bool FindSecondLastStartCode(const std::vector<std::uint8_t>& data, std::size_t* second_last, std::size_t* last) {
+    if (second_last == nullptr || last == nullptr) {
+        return false;
+    }
+    *second_last = std::string::npos;
+    *last = std::string::npos;
+
+    const auto* p = data.data();
+    const std::size_t n = data.size();
+    if (p == nullptr || n < 3) {
+        return false;
+    }
+
+    auto IsStartCodeAt = [&](std::size_t i) -> bool {
+        if (i + 3 > n) return false;
+        if (p[i] != 0x00 || p[i + 1] != 0x00) return false;
+        if (p[i + 2] == 0x01) return true;
+        if (i + 4 <= n && p[i + 2] == 0x00 && p[i + 3] == 0x01) return true;
+        return false;
+    };
+
+    for (std::size_t i = 0; i + 3 <= n; ++i) {
+        if (!IsStartCodeAt(i)) continue;
+        *second_last = *last;
+        *last = i;
+        // Skip over the common 4-byte start code to reduce redundant matches.
+        if (i + 4 <= n && p[i] == 0x00 && p[i + 1] == 0x00 && p[i + 2] == 0x00 && p[i + 3] == 0x01) {
+            i += 3;
+        } else if (i + 3 <= n && p[i] == 0x00 && p[i + 1] == 0x00 && p[i + 2] == 0x01) {
+            i += 2;
+        }
+    }
+
+    return *second_last != std::string::npos;
+}
+
+std::size_t FindFirstStartCode(const std::vector<std::uint8_t>& data) {
+    const auto* p = data.data();
+    const std::size_t n = data.size();
+    if (p == nullptr || n < 3) {
+        return std::string::npos;
+    }
+    for (std::size_t i = 0; i + 3 <= n; ++i) {
+        if (p[i] != 0x00 || p[i + 1] != 0x00) continue;
+        if (p[i + 2] == 0x01) return i;
+        if (i + 4 <= n && p[i + 2] == 0x00 && p[i + 3] == 0x01) return i;
+    }
+    return std::string::npos;
+}
+
 int WriteToFile(int64_t offset, const void* buffer, size_t size, void* token) {
     if (offset < 0 || buffer == nullptr || token == nullptr) {
         return -1;
@@ -458,7 +513,9 @@ int WriteToFile(int64_t offset, const void* buffer, size_t size, void* token) {
 
 unsigned DurationTo90kHz(std::uint64_t duration_us, double frame_rate) noexcept {
     if (duration_us != 0) {
-        const auto scaled = (duration_us * 90000ULL) / 1000000ULL;
+        // Use rounding (not floor) to avoid systematic drift for common frame durations like 33333us.
+        // 33333us should map to 3000 ticks at 90kHz (30fps).
+        const auto scaled = (duration_us * 90000ULL + 500000ULL) / 1000000ULL;
         return static_cast<unsigned>(std::max<std::uint64_t>(1ULL, scaled));
     }
 
@@ -529,9 +586,96 @@ bool Mp4FileMuxer::WritePacket(const EncodedPacket& packet) {
         return false;
     }
 
-    const auto duration_90khz = DurationTo90kHz(packet.duration, impl_->stream.frame_rate);
-    return mp4_h26x_write_nal(&impl_->writer, packet.data.data(), static_cast<int>(packet.data.size()), duration_90khz) ==
-           MP4E_STATUS_OK;
+    // We use MP4E_put_sample directly and must pass a *sample duration* in 90kHz timebase.
+    const double fps = impl_->stream.frame_rate > 0.0 ? impl_->stream.frame_rate : 30.0;
+    const auto fallback_dur_us_ll = std::llround(1000000.0 / fps);
+    const std::uint64_t fallback_dur_us =
+        static_cast<std::uint64_t>(fallback_dur_us_ll <= 0 ? 1LL : fallback_dur_us_ll);
+    const std::uint64_t dur_us = packet.duration != 0 ? packet.duration : fallback_dur_us;
+    const unsigned dur90 = DurationTo90kHz(dur_us, fps);
+
+    // Encode path guarantee (per MSP semantics): AX_VENC_GetStream returns one pack per encoded frame.
+    // Treat each packet as a complete access unit (AU) and mux one MP4 sample per WritePacket call.
+    const auto first = FindFirstStartCode(packet.data);
+    if (first == std::string::npos) {
+        return false;
+    }
+
+    const std::uint8_t* cur = packet.data.data() + first;
+    const std::uint8_t* eof = packet.data.data() + packet.data.size();
+    bool is_key = packet.key_frame;
+    std::vector<std::uint8_t> sample;
+    sample.reserve(packet.data.size() + 64);
+
+    for (;;) {
+        int nal_size = 0;
+        const std::uint8_t* nal = find_nal_unit(cur, static_cast<int>(eof - cur), &nal_size);
+        if (nal_size <= 0 || nal == nullptr) {
+            break;
+        }
+
+        if (impl_->stream.codec == VideoCodecType::kH265) {
+            const int t = (nal[0] >> 1) & 0x3f;
+            if (t == HEVC_NAL_VPS) {
+                MP4E_set_vps(impl_->mux, impl_->writer.mux_track_id, nal, nal_size);
+                cur = nal + nal_size;
+                continue;
+            }
+            if (t == HEVC_NAL_SPS) {
+                MP4E_set_sps(impl_->mux, impl_->writer.mux_track_id, nal, nal_size);
+                cur = nal + nal_size;
+                continue;
+            }
+            if (t == HEVC_NAL_PPS) {
+                MP4E_set_pps(impl_->mux, impl_->writer.mux_track_id, nal, nal_size);
+                cur = nal + nal_size;
+                continue;
+            }
+            const bool intra = (t >= HEVC_NAL_BLA_W_LP && t <= HEVC_NAL_CRA_NUT);
+            if (intra) is_key = true;
+        } else {
+            const int t = nal[0] & 31;
+            if (t == 9) {  // AUD
+                cur = nal + nal_size;
+                continue;
+            }
+            if (t == 7) {
+                MP4E_set_sps(impl_->mux, impl_->writer.mux_track_id, nal, nal_size);
+                cur = nal + nal_size;
+                continue;
+            }
+            if (t == 8) {
+                MP4E_set_pps(impl_->mux, impl_->writer.mux_track_id, nal, nal_size);
+                cur = nal + nal_size;
+                continue;
+            }
+            if (t == 5) is_key = true;
+        }
+
+        // Append length-prefixed NAL to the sample buffer.
+        const std::uint32_t sz = static_cast<std::uint32_t>(nal_size);
+        sample.push_back(static_cast<std::uint8_t>(sz >> 24));
+        sample.push_back(static_cast<std::uint8_t>(sz >> 16));
+        sample.push_back(static_cast<std::uint8_t>(sz >> 8));
+        sample.push_back(static_cast<std::uint8_t>(sz));
+        sample.insert(sample.end(), nal, nal + nal_size);
+
+        cur = nal + nal_size;
+    }
+
+    // Packet may contain only codec config (VPS/SPS/PPS/AUD). No video sample to write in that case.
+    if (sample.empty()) {
+        return true;
+    }
+
+    const int kind = is_key ? MP4E_SAMPLE_RANDOM_ACCESS : MP4E_SAMPLE_DEFAULT;
+    const int put = MP4E_put_sample(impl_->mux,
+                                    impl_->writer.mux_track_id,
+                                    sample.data(),
+                                    static_cast<int>(sample.size()),
+                                    static_cast<int>(std::min<unsigned>(dur90, INT_MAX)),
+                                    kind);
+    return put == MP4E_STATUS_OK;
 }
 
 void Mp4FileMuxer::Close() noexcept {

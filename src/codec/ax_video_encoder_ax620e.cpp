@@ -158,20 +158,31 @@ protected:
         }
 
         const auto& frame_info = common::internal::AxImageAccess::GetAxFrameInfo(frame);
-        const auto ret = AX_VENC_SendFrame(channel_, &frame_info, kAxWaitMs);
+        // Feed the visible geometry (crop) to VENC for attribute matching.
+        AX_VIDEO_FRAME_INFO_T send_info = frame_info;
+        if (send_info.stVFrame.s16CropWidth > 0) {
+            send_info.stVFrame.u32Width = static_cast<AX_U32>(send_info.stVFrame.s16CropWidth);
+        }
+        if (send_info.stVFrame.s16CropHeight > 0) {
+            send_info.stVFrame.u32Height = static_cast<AX_U32>(send_info.stVFrame.s16CropHeight);
+        }
+
+        const auto ret = AX_VENC_SendFrame(channel_, &send_info, kAxWaitMs);
         if (ret != AX_SUCCESS) {
             static std::atomic<std::uint32_t> s_send_failures{0};
             const auto failures = s_send_failures.fetch_add(1, std::memory_order_relaxed);
             if (failures < 20 || (failures % 200) == 0) {
                 std::fprintf(stderr,
-                             "ax620e venc: AX_VENC_SendFrame chn=%d ret=0x%x blk=0x%x fmt=%d %ux%u stride=%u/%u pts=%llu seq=%llu\n",
+                             "ax620e venc: AX_VENC_SendFrame chn=%d ret=0x%x blk=0x%x fmt=%d %ux%u crop=%d,%d+%dx%d stride=%u/%u pts=%llu seq=%llu\n",
                              channel_, ret,
-                             frame_info.stVFrame.u32BlkId[0],
-                             static_cast<int>(frame_info.stVFrame.enImgFormat),
-                             frame_info.stVFrame.u32Width, frame_info.stVFrame.u32Height,
-                             frame_info.stVFrame.u32PicStride[0], frame_info.stVFrame.u32PicStride[1],
-                             static_cast<unsigned long long>(frame_info.stVFrame.u64PTS),
-                             static_cast<unsigned long long>(frame_info.stVFrame.u64SeqNum));
+                             send_info.stVFrame.u32BlkId[0],
+                             static_cast<int>(send_info.stVFrame.enImgFormat),
+                             send_info.stVFrame.u32Width, send_info.stVFrame.u32Height,
+                             static_cast<int>(send_info.stVFrame.s16CropX), static_cast<int>(send_info.stVFrame.s16CropY),
+                             static_cast<int>(send_info.stVFrame.s16CropWidth), static_cast<int>(send_info.stVFrame.s16CropHeight),
+                             send_info.stVFrame.u32PicStride[0], send_info.stVFrame.u32PicStride[1],
+                             static_cast<unsigned long long>(send_info.stVFrame.u64PTS),
+                             static_cast<unsigned long long>(send_info.stVFrame.u64SeqNum));
             }
         }
         return ret == AX_SUCCESS;

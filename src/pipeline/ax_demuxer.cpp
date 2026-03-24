@@ -163,10 +163,11 @@ public:
                     continue;
                 }
 
-                const auto packet_duration_us = ToMicroseconds(packet->duration, video_info_.timescale, video_info_.fps);
+                // Mp4Demuxer already normalizes timestamps to microseconds.
+                const auto packet_duration_us = packet->duration;
                 const auto effective_duration_us =
                     packet_duration_us == 0 ? ResolveFallbackFrameDurationUs() : packet_duration_us;
-                const auto packet_pts_us = ToMicroseconds(packet->pts, video_info_.timescale, video_info_.fps);
+                const auto packet_pts_us = packet->pts;
 
                 if (config_.realtime_playback) {
                     if (!first_packet_) {

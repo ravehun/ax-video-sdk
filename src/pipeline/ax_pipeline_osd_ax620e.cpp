@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "ax_sys_api.h"
 
 #include "ax_image_internal.h"
+#include "ax_ivps_lock.h"
 #include "common/ax_system.h"
 
 namespace axvsdk::common::internal {
@@ -185,11 +187,20 @@ bool BuildCanvas(common::AxImage& image, AX_IVPS_RGN_CANVAS_INFO_T* canvas) {
     std::memset(canvas, 0, sizeof(*canvas));
     canvas->nPhyAddr = frame.u64PhyAddr[0];
     canvas->pVirAddr = reinterpret_cast<AX_VOID*>(static_cast<std::uintptr_t>(frame.u64VirAddr[0]));
-    canvas->nUVOffset =
-        frame.u64PhyAddr[1] > frame.u64PhyAddr[0] ? static_cast<AX_U32>(frame.u64PhyAddr[1] - frame.u64PhyAddr[0]) : 0;
     canvas->nStride = frame.u32PicStride[0];
     canvas->nW = static_cast<AX_U16>(frame.u32Width);
-    canvas->nH = static_cast<AX_U16>(frame.u32Height);
+    // Match MSP samples: derive the aligned canvas height from the UV offset and keep nUVOffset=0.
+    // Some MSP versions mis-handle non-zero nUVOffset in draw APIs.
+    AX_U16 canvas_h = static_cast<AX_U16>(frame.u32Height);
+    if (frame.u32PicStride[0] != 0 && frame.u64PhyAddr[1] > frame.u64PhyAddr[0]) {
+        const AX_U64 delta = frame.u64PhyAddr[1] - frame.u64PhyAddr[0];
+        const AX_U64 h64 = delta / static_cast<AX_U64>(frame.u32PicStride[0]);
+        if (h64 > 0 && h64 <= static_cast<AX_U64>(std::numeric_limits<AX_U16>::max())) {
+            canvas_h = static_cast<AX_U16>(h64);
+        }
+    }
+    canvas->nH = canvas_h;
+    canvas->nUVOffset = 0;
     canvas->eFormat = frame.enImgFormat;
     return true;
 }
@@ -273,6 +284,9 @@ public:
         if (!common::IsSystemInitialized()) {
             return false;
         }
+
+        // Serialize IVPS draw operations with other IVPS users (e.g. pre-process) to avoid MSP thread-safety issues.
+        std::lock_guard<std::mutex> ivps_lock(common::internal::IvpsGlobalMutex());
 
         AX_VIDEO_FRAME_T frame{};
         if (!ResolveFrame(image, &frame)) {

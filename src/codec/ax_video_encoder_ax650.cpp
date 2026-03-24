@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -154,7 +155,31 @@ protected:
         }
 
         const auto& frame_info = common::internal::AxImageAccess::GetAxFrameInfo(frame);
-        const auto ret = AX_VENC_SendFrame(channel_, &frame_info, kAxWaitMs);
+        // VDEC/IVPS may output coded height (aligned) with crop describing the visible geometry.
+        // VENC validates u32Width/u32Height against channel attributes, so feed the visible geometry here.
+        AX_VIDEO_FRAME_INFO_T send_info = frame_info;
+        if (send_info.stVFrame.s16CropWidth > 0) {
+            send_info.stVFrame.u32Width = static_cast<AX_U32>(send_info.stVFrame.s16CropWidth);
+        }
+        if (send_info.stVFrame.s16CropHeight > 0) {
+            send_info.stVFrame.u32Height = static_cast<AX_U32>(send_info.stVFrame.s16CropHeight);
+        }
+
+        const auto ret = AX_VENC_SendFrame(channel_, &send_info, kAxWaitMs);
+        if (ret != AX_SUCCESS) {
+            const auto& vf = send_info.stVFrame;
+            std::fprintf(stderr,
+                         "ax650 venc: AX_VENC_SendFrame chn=%d ret=0x%x fmt=%d %ux%u crop=%d,%d+%dx%d stride=%u/%u blk=0x%x pts=%llu seq=%llu\n",
+                         channel_, ret,
+                         static_cast<int>(vf.enImgFormat),
+                         vf.u32Width, vf.u32Height,
+                         static_cast<int>(vf.s16CropX), static_cast<int>(vf.s16CropY),
+                         static_cast<int>(vf.s16CropWidth), static_cast<int>(vf.s16CropHeight),
+                         vf.u32PicStride[0], vf.u32PicStride[1],
+                         vf.u32BlkId[0],
+                         static_cast<unsigned long long>(vf.u64PTS),
+                         static_cast<unsigned long long>(vf.u64SeqNum));
+        }
         return ret == AX_SUCCESS;
     }
 

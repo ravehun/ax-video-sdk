@@ -169,6 +169,9 @@ void AxVideoDecoderBase::Stop() noexcept {
 
 bool AxVideoDecoderBase::SubmitPacket(EncodedPacket packet) {
     if (!running_ || packet.data.empty()) {
+        std::fprintf(stderr,
+                     "vdec SubmitPacket reject (early): running=%d bytes=%zu\n",
+                     running_ ? 1 : 0, packet.data.size());
         return false;
     }
 
@@ -177,6 +180,10 @@ bool AxVideoDecoderBase::SubmitPacket(EncodedPacket packet) {
         return stop_requested_ || pending_packets_.size() < kDecodeInputQueueDepth;
     });
     if (stop_requested_ || input_eos_requested_) {
+        std::fprintf(stderr,
+                     "vdec SubmitPacket reject: stop=%d eos=%d pending=%zu/%zu bytes=%zu\n",
+                     stop_requested_ ? 1 : 0, input_eos_requested_ ? 1 : 0,
+                     pending_packets_.size(), kDecodeInputQueueDepth, packet.data.size());
         return false;
     }
     pending_packets_.push_back(std::move(packet));
@@ -274,6 +281,8 @@ void AxVideoDecoderBase::SendLoop() {
         }
 
         if (!SendEncodedPacket(packet)) {
+            std::fprintf(stderr, "vdec SendEncodedPacket failed: pts=%llu bytes=%zu\n",
+                         static_cast<unsigned long long>(packet.pts), packet.data.size());
             break;
         }
     }
@@ -294,6 +303,19 @@ void AxVideoDecoderBase::ReceiveLoop() {
                 break;
             }
             continue;
+        }
+
+        // Some firmwares return macroblock-aligned coded dimensions in u32Width/u32Height but
+        // don't populate crop fields. Preserve the "real" stream geometry for downstream modules
+        // (NPU mapping, VENC attribute match) by filling crop from the known stream info.
+        if ((frame_info.stVFrame.s16CropWidth <= 0 || frame_info.stVFrame.s16CropHeight <= 0) &&
+            video_info_.width != 0 && video_info_.height != 0 &&
+            video_info_.width <= frame_info.stVFrame.u32Width &&
+            video_info_.height <= frame_info.stVFrame.u32Height) {
+            frame_info.stVFrame.s16CropX = 0;
+            frame_info.stVFrame.s16CropY = 0;
+            frame_info.stVFrame.s16CropWidth = static_cast<AX_S16>(video_info_.width);
+            frame_info.stVFrame.s16CropHeight = static_cast<AX_S16>(video_info_.height);
         }
 
         PublishFrame(frame_info);

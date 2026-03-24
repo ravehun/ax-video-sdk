@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <utility>
@@ -9,6 +11,7 @@
 #include "common/ax_image_processor.h"
 #include "common/ax_system.h"
 #include "ax_image_copy.h"
+#include "ax_image_internal.h"
 #if defined(AXSDK_PLATFORM_AXCL)
 #include "ax_system_internal.h"
 #else
@@ -28,12 +31,31 @@ namespace axvsdk::codec::internal {
 namespace {
 
 constexpr int kEncoderStopIdlePollLimit = 10;
-constexpr std::size_t kEncoderInputFifoDepth = 4;
+// How many sent frames we keep alive before allowing their buffers to be reused.
+// For ax620e-family, VENC may keep referencing decoder pool blocks longer than the HW input FIFO depth.
+// If we drop references too early, VDEC can reuse/overwrite the same CMM blocks, causing visible "flashback"/jitter.
+#if defined(AXSDK_CHIP_AX620E_FAMILY)
+// 20e family: use (almost) the full private pool before reusing blocks. Reusing too early can still
+// cause rare "flashback" when VENC keeps a reference to older inputs longer than expected.
+// Pool size is kEncoderPoolBlockCount (=8), so keep 7 in-flight and reuse the 8th as a ring.
+constexpr std::size_t kEncoderReusableInflightDepth = 7;  // our own pool-backed staging frames
+constexpr std::size_t kEncoderHoldInflightDepth = 12;     // decoder-backed frames (alias path)
+#else
+constexpr std::size_t kEncoderReusableInflightDepth = 4;
+constexpr std::size_t kEncoderHoldInflightDepth = 4;
+#endif
 
 #if defined(AXSDK_CHIP_AX620E_FAMILY)
 constexpr AX_U32 kEncoderPoolBlockCount = 8;
 constexpr AX_U64 kEncoderPoolMetaSize = 512;
 #endif
+
+static std::uint32_t AlignUpU32(std::uint32_t value, std::uint32_t alignment) noexcept {
+    if (alignment == 0) {
+        return value;
+    }
+    return ((value + alignment - 1U) / alignment) * alignment;
+}
 
 std::uint32_t EstimateBitrateKbps(VideoCodecType codec,
                                   std::uint32_t width,
@@ -57,8 +79,10 @@ ResolvedVideoEncoderConfig ResolveConfig(const VideoEncoderConfig& config) noexc
     resolved.width = config.width;
     resolved.height = config.height;
     resolved.device_id = config.device_id;
-    resolved.max_width = config.width;
-    resolved.max_height = config.height;
+    // Hardware encoders commonly operate on macroblock-aligned buffers; allow aligned coded
+    // dimensions while keeping visible width/height in `resolved.width/height`.
+    resolved.max_width = AlignUpU32(config.width, 16);
+    resolved.max_height = AlignUpU32(config.height, 16);
     resolved.src_frame_rate = config.frame_rate > 0.0 ? config.frame_rate : 30.0;
     resolved.dst_frame_rate = resolved.src_frame_rate;
     resolved.bitrate_kbps = config.bitrate_kbps > 0
@@ -80,12 +104,16 @@ ResolvedVideoEncoderConfig ResolveConfig(const VideoEncoderConfig& config) noexc
 // ax620e/ax630c family: VENC and some firmware paths are more robust with pool-backed buffers (u32BlkId valid).
 // Use a small private pool per encoder instance for reusable intermediate frames.
 static std::size_t PlaneHeight(const common::ImageDescriptor& descriptor, std::size_t plane_index) noexcept {
+    constexpr std::uint32_t kNv12HeightAlignment = 16;
+    const auto layout_h = descriptor.format == common::PixelFormat::kNv12
+                              ? AlignUpU32(descriptor.height, kNv12HeightAlignment)
+                              : descriptor.height;
     switch (descriptor.format) {
     case common::PixelFormat::kNv12:
-        return plane_index == 0 ? descriptor.height : descriptor.height / 2U;
+        return plane_index == 0 ? layout_h : layout_h / 2U;
     case common::PixelFormat::kRgb24:
     case common::PixelFormat::kBgr24:
-        return descriptor.height;
+        return layout_h;
     case common::PixelFormat::kUnknown:
     default:
         return 0;
@@ -309,32 +337,43 @@ bool AxVideoEncoderBase::ValidateInputFrame(const common::AxImage& frame) const 
 }
 
 common::AxImage::Ptr AxVideoEncoderBase::AcquireReusableFrame(const common::ImageDescriptor& descriptor,
-                                                              const char* token) {
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    for (auto it = reusable_frames_.begin(); it != reusable_frames_.end(); ++it) {
-        const auto& candidate = *it;
-        if (!candidate) {
-            continue;
-        }
-        if (candidate->descriptor().format == descriptor.format && candidate->width() == descriptor.width &&
-            candidate->height() == descriptor.height && candidate->stride(0) == descriptor.strides[0] &&
-            candidate->stride(1) == descriptor.strides[1]) {
-            auto frame = std::move(*it);
-            reusable_frames_.erase(it);
-            return frame;
+                                                              const char* token,
+                                                              bool require_pool) {
+    if (!require_pool) {
+        std::lock_guard<std::mutex> lock(staging_mutex_);
+        for (auto it = reusable_frames_.begin(); it != reusable_frames_.end(); ++it) {
+            const auto& candidate = *it;
+            if (!candidate) {
+                continue;
+            }
+            // Never reuse pool-backed frames here. For ax620e-family encoders we rely on AX_POOL ref-counting:
+            // frames are released back to the pool after AX_VENC_SendFrame and must not be kept/reused by the app.
+            if (candidate->memory_type() == common::MemoryType::kPool) {
+                continue;
+            }
+            if (candidate->descriptor().format == descriptor.format && candidate->width() == descriptor.width &&
+                candidate->height() == descriptor.height && candidate->stride(0) == descriptor.strides[0] &&
+                candidate->stride(1) == descriptor.strides[1]) {
+                auto frame = std::move(*it);
+                reusable_frames_.erase(it);
+                return frame;
+            }
         }
     }
 
 #if defined(AXSDK_CHIP_AX620E_FAMILY)
-    if (descriptor.format == common::PixelFormat::kNv12) {
+    if (require_pool && descriptor.format == common::PixelFormat::kNv12) {
         const auto block_size = ComputeImageByteSize(descriptor);
         if (block_size != 0) {
             std::uint32_t pool_id = common::kInvalidPoolId;
-            for (const auto& entry : pools_) {
-                if (entry.pool_id != common::kInvalidPoolId && entry.block_size == block_size &&
-                    SameDescriptor(entry.descriptor, descriptor)) {
-                    pool_id = entry.pool_id;
-                    break;
+            {
+                std::lock_guard<std::mutex> lock(staging_mutex_);
+                for (const auto& entry : pools_) {
+                    if (entry.pool_id != common::kInvalidPoolId && entry.block_size == block_size &&
+                        SameDescriptor(entry.descriptor, descriptor)) {
+                        pool_id = entry.pool_id;
+                        break;
+                    }
                 }
             }
 
@@ -351,6 +390,7 @@ common::AxImage::Ptr AxVideoEncoderBase::AcquireReusableFrame(const common::Imag
                 const auto created_pool = AX_POOL_CreatePool(&pool_config);
                 if (created_pool != AX_INVALID_POOLID) {
                     pool_id = static_cast<std::uint32_t>(created_pool);
+                    std::lock_guard<std::mutex> lock(staging_mutex_);
                     pools_.push_back(PoolEntry{descriptor, block_size, pool_id});
                 }
             }
@@ -368,6 +408,9 @@ common::AxImage::Ptr AxVideoEncoderBase::AcquireReusableFrame(const common::Imag
                 }
             }
         }
+        // Pool-backed output is required for the ax620e-family encoder (AX_MEMORY_SOURCE_POOL). Do not fall back to
+        // CMM here; the channel would reject/unsafe-handle non-pool buffers.
+        return nullptr;
     }
 #endif
 
@@ -383,17 +426,24 @@ void AxVideoEncoderBase::RecyclePreparedFrame(common::AxImage::Ptr frame) {
     if (!frame) {
         return;
     }
+    // Pool-backed frames must be returned to the pool immediately (AxImage dtor calls AX_POOL_ReleaseBlock).
+    if (frame->memory_type() == common::MemoryType::kPool) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(staging_mutex_);
     reusable_frames_.push_back(std::move(frame));
 }
 
 void AxVideoEncoderBase::ReleaseOldInflightFrame() {
     std::lock_guard<std::mutex> lock(staging_mutex_);
-    if (inflight_frames_.size() > kEncoderInputFifoDepth) {
-        reusable_frames_.push_back(std::move(inflight_frames_.front()));
+    if (inflight_frames_.size() > kEncoderReusableInflightDepth) {
+        auto old = std::move(inflight_frames_.front());
+        if (old && old->memory_type() != common::MemoryType::kPool) {
+            reusable_frames_.push_back(std::move(old));
+        }
         inflight_frames_.pop_front();
     }
-    while (inflight_hold_frames_.size() > kEncoderInputFifoDepth) {
+    while (inflight_hold_frames_.size() > kEncoderHoldInflightDepth) {
         inflight_hold_frames_.pop_front();
     }
 }
@@ -405,17 +455,41 @@ PreparedInputFrame AxVideoEncoderBase::PrepareInputFrame(const common::AxImage& 
     }
 #endif
     const auto target_stride = static_cast<std::size_t>(config_.width);
-    const bool already_hw_ready =
+    const bool hw_geometry_ready =
         frame.format() == common::PixelFormat::kNv12 &&
         frame.width() == config_.width &&
         frame.height() == config_.height &&
         frame.physical_address(0) != 0 &&
         frame.stride(0) >= target_stride &&
         frame.stride(1) >= target_stride;
+
+#if defined(AXSDK_CHIP_AX620E_FAMILY)
+    // AX620E family:
+    // Directly feeding pool-backed frames from upstream (notably VDEC) into VENC can produce visible
+    // "flashback"/jitter, likely because VENC does not reliably retain references to foreign pool blocks.
+    // To make buffer lifetime deterministic, only bypass the copy when the block belongs to an encoder-owned pool.
+    bool already_hw_ready = false;
+    if (hw_geometry_ready && frame.block_id(0) != common::kInvalidPoolId) {
+        const auto blk_pool = AX_POOL_Handle2PoolId(static_cast<AX_BLK>(frame.block_id(0)));
+        if (blk_pool != AX_INVALID_POOLID) {
+            std::lock_guard<std::mutex> lock(staging_mutex_);
+            for (const auto& entry : pools_) {
+                if (entry.pool_id != common::kInvalidPoolId &&
+                    static_cast<AX_POOL>(entry.pool_id) == blk_pool) {
+                    already_hw_ready = true;
+                    break;
+                }
+            }
+        }
+    }
+#else
+    const bool already_hw_ready = hw_geometry_ready;
+#endif
+
     if (already_hw_ready) {
         auto alias = common::AxImage::Ptr(const_cast<common::AxImage*>(&frame), [](common::AxImage*) {});
-        const bool needs_keep_alive = frame.block_id(0) == common::kInvalidPoolId;
-        return {std::move(alias), false, needs_keep_alive};
+        // Pool-backed frames: the driver retains the block reference; no extra keep-alive required.
+        return {std::move(alias), false, false};
     }
 
     common::ImageDescriptor target{};
@@ -428,7 +502,19 @@ PreparedInputFrame AxVideoEncoderBase::PrepareInputFrame(const common::AxImage& 
     const bool needs_processing = frame.format() != target.format || frame.width() != target.width ||
                                   frame.height() != target.height || frame.physical_address(0) == 0;
     if (!needs_processing) {
-        auto output = AcquireReusableFrame(target, "VideoEncoderInput");
+        common::AxImage::Ptr output;
+#if defined(AXSDK_CHIP_AX620E_FAMILY)
+        // When using AX_MEMORY_SOURCE_POOL, block until a pool block is available.
+        for (int attempt = 0; attempt < 200 && !stop_requested(); ++attempt) {
+            output = AcquireReusableFrame(target, "VideoEncoderInput", true);
+            if (output) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+#else
+        output = AcquireReusableFrame(target, "VideoEncoderInput", false);
+#endif
         if (!output || !common::internal::CopyImage(frame, output.get())) {
             std::fprintf(stderr,
                          "venc prepare: copy failed fmt=%d %ux%u stride=%zu/%zu phy=%llu blk=0x%x -> %ux%u\n",
@@ -439,6 +525,7 @@ PreparedInputFrame AxVideoEncoderBase::PrepareInputFrame(const common::AxImage& 
                          target.width, target.height);
             return {};
         }
+        common::internal::AxImageAccess::CopyFrameMetadata(frame, output.get());
         return {std::move(output), true, true};
     }
 
@@ -451,7 +538,7 @@ PreparedInputFrame AxVideoEncoderBase::PrepareInputFrame(const common::AxImage& 
     common::AxImage::Ptr source = common::AxImage::Ptr(const_cast<common::AxImage*>(&frame), [](common::AxImage*) {});
     bool source_reusable = false;
     if (frame.physical_address(0) == 0) {
-        source = AcquireReusableFrame(frame.descriptor(), "VideoEncoderSource");
+        source = AcquireReusableFrame(frame.descriptor(), "VideoEncoderSource", false);
         if (!source || !common::internal::CopyImage(frame, source.get())) {
             std::fprintf(stderr,
                          "venc prepare: acquire/copy host source failed fmt=%d %ux%u\n",
@@ -483,7 +570,18 @@ PreparedInputFrame AxVideoEncoderBase::PrepareInputFrame(const common::AxImage& 
             request.crop.height = target.height;
         }
     }
-    auto output = AcquireReusableFrame(target, "VideoEncoderInput");
+    common::AxImage::Ptr output;
+#if defined(AXSDK_CHIP_AX620E_FAMILY)
+    for (int attempt = 0; attempt < 200 && !stop_requested(); ++attempt) {
+        output = AcquireReusableFrame(target, "VideoEncoderInput", true);
+        if (output) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#else
+    output = AcquireReusableFrame(target, "VideoEncoderInput", false);
+#endif
     if (!output) {
         std::fprintf(stderr,
                      "venc prepare: acquire output failed fmt=%d %ux%u stride=%zu/%zu\n",
@@ -504,6 +602,7 @@ PreparedInputFrame AxVideoEncoderBase::PrepareInputFrame(const common::AxImage& 
         }
         return {};
     }
+    common::internal::AxImageAccess::CopyFrameMetadata(frame, output.get());
     if (source_reusable) {
         RecyclePreparedFrame(std::move(source));
     }
@@ -538,7 +637,7 @@ void AxVideoEncoderBase::SendLoop() {
         (void)prepared.frame->FlushCache();
         if (SendFrameToEncoder(*prepared.frame)) {
             if (prepared.reusable) {
-                {
+                if (prepared.frame->memory_type() != common::MemoryType::kPool) {
                     std::lock_guard<std::mutex> lock(staging_mutex_);
                     inflight_frames_.push_back(std::move(prepared.frame));
                 }
@@ -551,6 +650,7 @@ void AxVideoEncoderBase::SendLoop() {
             }
             ReleaseOldInflightFrame();
         } else if (prepared.reusable) {
+            // For pool frames, dropping releases the block back to the pool.
             RecyclePreparedFrame(std::move(prepared.frame));
         }
     }

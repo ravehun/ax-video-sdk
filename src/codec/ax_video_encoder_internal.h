@@ -69,7 +69,8 @@ private:
         std::uint32_t pool_id{common::kInvalidPoolId};
     };
 
-    common::AxImage::Ptr AcquireReusableFrame(const common::ImageDescriptor& descriptor, const char* token);
+    common::AxImage::Ptr AcquireReusableFrame(const common::ImageDescriptor& descriptor, const char* token,
+                                              bool require_pool);
     void RecyclePreparedFrame(common::AxImage::Ptr frame);
     void ReleaseOldInflightFrame();
     void SendLoop();

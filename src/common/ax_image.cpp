@@ -31,6 +31,33 @@ namespace {
 
 constexpr std::size_t kRgbChannels = 3;
 
+AX_U32 ToAxPicStride(PixelFormat format, std::size_t byte_stride) noexcept {
+    switch (format) {
+    case PixelFormat::kRgb24:
+    case PixelFormat::kBgr24:
+        // AX u32PicStride for RGB/BGR is in pixels (see MSP samples).
+        return static_cast<AX_U32>(byte_stride / kRgbChannels);
+    case PixelFormat::kNv12:
+    case PixelFormat::kUnknown:
+    default:
+        // NV12 stride is already in bytes.
+        return static_cast<AX_U32>(byte_stride);
+    }
+}
+
+std::size_t FromAxPicStride(PixelFormat format, AX_U32 pic_stride) noexcept {
+    switch (format) {
+    case PixelFormat::kRgb24:
+    case PixelFormat::kBgr24:
+        // AX u32PicStride for RGB/BGR is in pixels.
+        return static_cast<std::size_t>(pic_stride) * kRgbChannels;
+    case PixelFormat::kNv12:
+    case PixelFormat::kUnknown:
+    default:
+        return static_cast<std::size_t>(pic_stride);
+    }
+}
+
 std::size_t PlaneCountForFormat(PixelFormat format) noexcept {
     switch (format) {
     case PixelFormat::kNv12:
@@ -91,6 +118,10 @@ bool IsValidDescriptor(const ImageDescriptor& descriptor) noexcept {
         if (stride < min_stride) {
             return false;
         }
+        if ((descriptor.format == PixelFormat::kRgb24 || descriptor.format == PixelFormat::kBgr24) &&
+            (stride % kRgbChannels) != 0U) {
+            return false;
+        }
     }
 
     return true;
@@ -144,6 +175,7 @@ MemoryType ResolveMemoryType(MemoryType memory_type) noexcept {
 
 struct AxImage::Impl {
     ImageDescriptor descriptor{};
+    std::uint32_t layout_height{0};  // internal allocation height (may include padding)
     std::size_t plane_count{0};
     std::array<std::size_t, kMaxImagePlanes> plane_offsets{};
     std::array<std::size_t, kMaxImagePlanes> plane_sizes{};
@@ -158,8 +190,10 @@ struct AxImage::Impl {
     internal::AxImageAccess::FrameReleaseCallback release_callback;
     std::shared_ptr<void> lifetime_holder;
 
-    void InitializeLayout(const ImageDescriptor& descriptor) {
+    void InitializeLayout(const ImageDescriptor& descriptor, MemoryType memory_type_for_layout) {
+        (void)memory_type_for_layout;
         this->descriptor = NormalizeDescriptor(descriptor);
+        layout_height = this->descriptor.height;
         plane_count = PlaneCountForFormat(this->descriptor.format);
         plane_offsets.fill(0);
         plane_sizes.fill(0);
@@ -170,9 +204,15 @@ struct AxImage::Impl {
 
         for (std::size_t index = 0; index < plane_count; ++index) {
             plane_offsets[index] = total_size;
-            plane_sizes[index] = this->descriptor.strides[index] * PlaneHeight(this->descriptor, index);
+            ImageDescriptor layout_descriptor = this->descriptor;
+            layout_descriptor.height = layout_height;
+            plane_sizes[index] = this->descriptor.strides[index] * PlaneHeight(layout_descriptor, index);
             total_size += plane_sizes[index];
         }
+    }
+
+    void InitializeLayout(const ImageDescriptor& descriptor) {
+        InitializeLayout(descriptor, MemoryType::kExternal);
     }
 
     void PopulateFrameInfo(AX_U64 base_phy_addr, void* base_vir_addr, AX_BLK block_id) noexcept {
@@ -181,6 +221,10 @@ struct AxImage::Impl {
         auto& frame = frame_info.stVFrame;
         frame.u32Width = descriptor.width;
         frame.u32Height = descriptor.height;
+        frame.s16CropX = 0;
+        frame.s16CropY = 0;
+        frame.s16CropWidth = static_cast<AX_S16>(descriptor.width);
+        frame.s16CropHeight = static_cast<AX_S16>(descriptor.height);
         frame.enImgFormat = ToAxFormat(descriptor.format);
         frame.enVscanFormat = AX_VSCAN_FORMAT_RASTER;
         frame.stCompressInfo.enCompressMode = AX_COMPRESS_MODE_NONE;
@@ -193,7 +237,7 @@ struct AxImage::Impl {
 
         const auto base_vir = reinterpret_cast<std::uintptr_t>(base_vir_addr);
         for (std::size_t index = 0; index < plane_count; ++index) {
-            frame.u32PicStride[index] = static_cast<AX_U32>(descriptor.strides[index]);
+            frame.u32PicStride[index] = ToAxPicStride(descriptor.format, descriptor.strides[index]);
             frame.u64PhyAddr[index] = base_phy_addr + plane_offsets[index];
             frame.u64VirAddr[index] = static_cast<AX_U64>(base_vir + plane_offsets[index]);
             physical_addresses[index] = frame.u64PhyAddr[index];
@@ -312,8 +356,8 @@ AxImage::Ptr AxImage::Create(const ImageDescriptor& descriptor, const ImageAlloc
     }
 
     auto impl = std::make_unique<AxImage::Impl>();
-    impl->InitializeLayout(descriptor);
     impl->memory_type = ResolveMemoryType(options.memory_type);
+    impl->InitializeLayout(descriptor, impl->memory_type);
     impl->cache_mode = options.cache_mode;
 
     bool allocated = false;
@@ -361,11 +405,15 @@ AxImage::Ptr AxImage::WrapExternal(const ImageDescriptor& descriptor,
     frame.stDynamicRange = AX_DYNAMIC_RANGE_SDR8;
     frame.stColorGamut = AX_COLOR_GAMUT_BT709;
     frame.u32FrameSize = static_cast<AX_U32>(impl->total_size);
+    frame.s16CropX = 0;
+    frame.s16CropY = 0;
+    frame.s16CropWidth = static_cast<AX_S16>(impl->descriptor.width);
+    frame.s16CropHeight = static_cast<AX_S16>(impl->descriptor.height);
     impl->frame_info.enModId = AX_ID_USER;
     impl->frame_info.bEndOfStream = AX_FALSE;
 
     for (std::size_t index = 0; index < impl->plane_count; ++index) {
-        frame.u32PicStride[index] = static_cast<AX_U32>(impl->descriptor.strides[index]);
+        frame.u32PicStride[index] = ToAxPicStride(impl->descriptor.format, impl->descriptor.strides[index]);
         frame.u64PhyAddr[index] = planes[index].physical_address;
         frame.u64VirAddr[index] =
             static_cast<AX_U64>(reinterpret_cast<std::uintptr_t>(planes[index].virtual_address));
@@ -393,14 +441,19 @@ AxImage::Ptr internal::AxImageAccess::WrapVideoFrame(const AX_VIDEO_FRAME_INFO_T
         return nullptr;
     }
 
+    // Prefer crop geometry as the "visible" shape. Many hardware blocks use aligned coded
+    // width/height but populate crop fields to describe the real picture.
+    const auto crop_w = frame_info.stVFrame.s16CropWidth;
+    const auto crop_h = frame_info.stVFrame.s16CropHeight;
+
     ImageDescriptor descriptor{};
     descriptor.format = format;
-    descriptor.width = frame_info.stVFrame.u32Width;
-    descriptor.height = frame_info.stVFrame.u32Height;
+    descriptor.width = (crop_w > 0) ? static_cast<AX_U32>(crop_w) : frame_info.stVFrame.u32Width;
+    descriptor.height = (crop_h > 0) ? static_cast<AX_U32>(crop_h) : frame_info.stVFrame.u32Height;
 
     const auto plane_count = PlaneCountForFormat(format);
     for (std::size_t index = 0; index < plane_count; ++index) {
-        descriptor.strides[index] = frame_info.stVFrame.u32PicStride[index];
+        descriptor.strides[index] = FromAxPicStride(format, frame_info.stVFrame.u32PicStride[index]);
     }
 
     auto impl = std::make_unique<AxImage::Impl>();
@@ -410,6 +463,14 @@ AxImage::Ptr internal::AxImageAccess::WrapVideoFrame(const AX_VIDEO_FRAME_INFO_T
     impl->cache_mode = CacheMode::kNonCached;
     impl->owns_memory = false;
     impl->frame_info = frame_info;
+    // Ensure crop fields are non-zero and consistent with the visible descriptor. This helps
+    // downstream modules keep correct UV offsets and picture ordering when padding is present.
+    if (impl->frame_info.stVFrame.s16CropWidth <= 0 || impl->frame_info.stVFrame.s16CropHeight <= 0) {
+        impl->frame_info.stVFrame.s16CropX = 0;
+        impl->frame_info.stVFrame.s16CropY = 0;
+        impl->frame_info.stVFrame.s16CropWidth = static_cast<AX_S16>(descriptor.width);
+        impl->frame_info.stVFrame.s16CropHeight = static_cast<AX_S16>(descriptor.height);
+    }
     impl->release_callback = std::move(release_callback);
 
     for (std::size_t index = 0; index < impl->plane_count; ++index) {
@@ -596,6 +657,28 @@ void internal::AxImageAccess::AttachLifetime(AxImage* image, std::shared_ptr<voi
         return;
     }
     image->impl_->lifetime_holder = std::move(lifetime);
+}
+
+void internal::AxImageAccess::CopyFrameMetadata(const AxImage& source, AxImage* destination) noexcept {
+    if (destination == nullptr) {
+        return;
+    }
+
+    auto* dst = MutableAxFrameInfo(destination);
+    if (dst == nullptr) {
+        return;
+    }
+
+    const auto& src = GetAxFrameInfo(source);
+    dst->stVFrame.s16CropX = src.stVFrame.s16CropX;
+    dst->stVFrame.s16CropY = src.stVFrame.s16CropY;
+    dst->stVFrame.s16CropWidth = src.stVFrame.s16CropWidth;
+    dst->stVFrame.s16CropHeight = src.stVFrame.s16CropHeight;
+    dst->stVFrame.u32TimeRef = src.stVFrame.u32TimeRef;
+    dst->stVFrame.u64PTS = src.stVFrame.u64PTS;
+    dst->stVFrame.u64SeqNum = src.stVFrame.u64SeqNum;
+    dst->stVFrame.u64UserData = src.stVFrame.u64UserData;
+    dst->stVFrame.u32FrameFlag = src.stVFrame.u32FrameFlag;
 }
 
 }  // namespace axvsdk::common

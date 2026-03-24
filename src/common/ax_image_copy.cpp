@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #if defined(AXSDK_PLATFORM_AXCL)
@@ -16,11 +17,25 @@
 #endif
 
 #include "ax_image_internal.h"
+#include "ax_ivps_lock.h"
 #include "ax_system_internal.h"
 
 namespace axvsdk::common::internal {
 
 namespace {
+
+std::size_t ByteStrideFromAxPicStride(PixelFormat format, AX_U32 pic_stride) noexcept {
+    switch (format) {
+    case PixelFormat::kRgb24:
+    case PixelFormat::kBgr24:
+        // AX u32PicStride for RGB/BGR is in pixels.
+        return static_cast<std::size_t>(pic_stride) * 3U;
+    case PixelFormat::kNv12:
+    case PixelFormat::kUnknown:
+    default:
+        return static_cast<std::size_t>(pic_stride);
+    }
+}
 
 #if defined(AXSDK_PLATFORM_AXCL)
 bool SynchronizeAxclDevice() noexcept {
@@ -155,6 +170,54 @@ bool CopyFrameByCmm(const AX_VIDEO_FRAME_T& source_frame, AxImage* destination) 
 #endif
 }
 
+#if defined(AXSDK_CHIP_AX620E_FAMILY) && !defined(AXSDK_PLATFORM_AXCL)
+bool CopyFrameByCropResizeVpp(const AX_VIDEO_FRAME_T& source_frame, AxImage* destination) noexcept {
+    if (destination == nullptr ||
+        source_frame.u64PhyAddr[0] == 0 || destination->physical_address(0) == 0 ||
+        destination->width() == 0 || destination->height() == 0 ||
+        destination->format() != PixelFormat::kNv12) {
+        return false;
+    }
+
+    // IVPS is not consistently thread-safe across MSP/driver versions; serialize in-process.
+    std::lock_guard<std::mutex> ivps_lock(IvpsGlobalMutex());
+
+    auto* dst_frame = AxImageAccess::MutableAxFrame(destination);
+    if (dst_frame == nullptr) {
+        return false;
+    }
+
+    AX_VIDEO_FRAME_T src_frame = source_frame;
+    // Crop to the visible geometry (VDEC may output padded heights like 1088 for 1080p).
+    src_frame.s16CropX = 0;
+    src_frame.s16CropY = 0;
+    src_frame.s16CropWidth = static_cast<AX_S16>(destination->width());
+    src_frame.s16CropHeight = static_cast<AX_S16>(destination->height());
+
+    AX_IVPS_CROP_RESIZE_ATTR_T attr{};
+    attr.tAspectRatio.eMode = AX_IVPS_ASPECT_RATIO_STRETCH;
+    attr.tAspectRatio.eAligns[0] = AX_IVPS_ASPECT_RATIO_HORIZONTAL_CENTER;
+    attr.tAspectRatio.eAligns[1] = AX_IVPS_ASPECT_RATIO_VERTICAL_CENTER;
+    attr.tAspectRatio.nBgColor = 0;
+    attr.eSclType = AX_IVPS_SCL_TYPE_AUTO;
+    attr.eSclInput = AX_IVPS_SCL_INPUT_MONOPOLY;
+    attr.nAlpha = 255;
+
+    const auto ret = AX_IVPS_CropResizeVpp(&src_frame, dst_frame, &attr);
+    if (ret != AX_SUCCESS) {
+        std::fprintf(stderr,
+                     "ax620e copy: CropResizeVpp failed ret=0x%x src=%ux%u fmt=%d dst=%ux%u stride=%u/%u\n",
+                     ret,
+                     source_frame.u32Width, source_frame.u32Height, static_cast<int>(FromAxFormat(source_frame.enImgFormat)),
+                     destination->width(), destination->height(),
+                     dst_frame->u32PicStride[0], dst_frame->u32PicStride[1]);
+        return false;
+    }
+
+    return destination->InvalidateCache();
+}
+#endif
+
 #if defined(AXSDK_PLATFORM_AXCL)
 bool CopyPlaneByRuntime(const void* src,
                         std::size_t src_stride,
@@ -221,6 +284,14 @@ bool CopyImageImpl(const ImageDescriptor& source_descriptor,
     }
 
     if (source_frame != nullptr) {
+#if defined(AXSDK_CHIP_AX620E_FAMILY) && !defined(AXSDK_PLATFORM_AXCL)
+        // 20e family: use IVPS to do device-side copy for NV12 frames. This avoids expensive CPU memcpy in OSD/pipeline
+        // paths and prevents callback queue drops ("flashback/jitter") when running AI+OSD.
+        if (source_descriptor.format == PixelFormat::kNv12 && CopyFrameByCropResizeVpp(*source_frame, destination)) {
+            return true;
+        }
+#endif
+
         if (plane_count == 1 && CopyFrameByCmm(*source_frame, destination)) {
             return true;
         }
@@ -229,7 +300,8 @@ bool CopyImageImpl(const ImageDescriptor& source_descriptor,
         for (std::size_t plane = 0; plane < plane_count; ++plane) {
             const auto rows = PlaneRows(source_descriptor, plane);
             const auto row_bytes = PlaneRowBytes(source_descriptor, plane);
-            const auto src_stride = static_cast<std::size_t>(source_frame->u32PicStride[plane]);
+            const auto src_stride =
+                ByteStrideFromAxPicStride(source_descriptor.format, source_frame->u32PicStride[plane]);
             const auto dst_stride = destination->stride(plane);
             if (row_bytes == 0 || src_stride < row_bytes || dst_stride < row_bytes) {
                 ivps_copy_ok = false;
@@ -358,6 +430,8 @@ bool CopyImage(const AxImage& source, AxImage* destination) noexcept {
         return false;
     }
 
+    // Preserve timing/crop metadata so downstream components (VENC/MUX) keep correct ordering.
+    AxImageAccess::CopyFrameMetadata(source, destination);
     return true;
 }
 
@@ -368,15 +442,18 @@ bool CopyVideoFrameToImage(const AX_VIDEO_FRAME_INFO_T& frame_info, AxImage* des
 
     ImageDescriptor source_descriptor{};
     source_descriptor.format = FromAxFormat(frame_info.stVFrame.enImgFormat);
-    source_descriptor.width = frame_info.stVFrame.u32Width;
-    source_descriptor.height = frame_info.stVFrame.u32Height;
+    const auto crop_w = frame_info.stVFrame.s16CropWidth;
+    const auto crop_h = frame_info.stVFrame.s16CropHeight;
+    source_descriptor.width = (crop_w > 0) ? static_cast<AX_U32>(crop_w) : frame_info.stVFrame.u32Width;
+    source_descriptor.height = (crop_h > 0) ? static_cast<AX_U32>(crop_h) : frame_info.stVFrame.u32Height;
     const auto plane_count = PlaneCount(source_descriptor.format);
     if (plane_count == 0 || source_descriptor.width == 0 || source_descriptor.height == 0) {
         return false;
     }
 
     for (std::size_t plane = 0; plane < plane_count; ++plane) {
-        source_descriptor.strides[plane] = frame_info.stVFrame.u32PicStride[plane];
+        source_descriptor.strides[plane] =
+            ByteStrideFromAxPicStride(source_descriptor.format, frame_info.stVFrame.u32PicStride[plane]);
     }
 
     std::uint64_t source_phy_addrs[kMaxImagePlanes]{};
@@ -386,7 +463,8 @@ bool CopyVideoFrameToImage(const AX_VIDEO_FRAME_INFO_T& frame_info, AxImage* des
         source_phy_addrs[plane] = frame_info.stVFrame.u64PhyAddr[plane];
         source_vir_addrs[plane] = reinterpret_cast<const void*>(
             static_cast<std::uintptr_t>(frame_info.stVFrame.u64VirAddr[plane]));
-        source_strides[plane] = frame_info.stVFrame.u32PicStride[plane];
+        source_strides[plane] =
+            ByteStrideFromAxPicStride(source_descriptor.format, frame_info.stVFrame.u32PicStride[plane]);
     }
 
     return CopyImageImpl(source_descriptor, &frame_info.stVFrame, source_phy_addrs, source_vir_addrs,

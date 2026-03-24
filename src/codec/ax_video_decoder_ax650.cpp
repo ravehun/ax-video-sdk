@@ -20,9 +20,6 @@ constexpr AX_S32 kAxWaitMs = 100;
 constexpr AX_VDEC_CHN kOutputChannel = 0;
 constexpr AX_U32 kFrameBufferCount = 8;
 constexpr AX_U32 kFrameBufferCountH264 = 32;
-// Some streams (notably H.264 IDR frames) can be larger than what VDEC accepts in a single SendStream call.
-// Split bytestream into chunks and mark the last chunk with bEndOfFrame.
-constexpr std::size_t kMaxStreamChunkBytes = 256U * 1024U;
 
 AX_PAYLOAD_TYPE_E ToAxPayload(VideoCodecType codec) noexcept {
     switch (codec) {
@@ -162,45 +159,48 @@ protected:
     }
 
     bool SendEncodedPacket(const EncodedPacket& packet) override {
-        if (group_ < 0 || stream_vir_addr_ == nullptr || packet.data.empty() || packet.data.size() > stream_buffer_size_) {
+        if (group_ < 0 || stream_vir_addr_ == nullptr || packet.data.empty()) {
             return false;
         }
 
-        std::size_t offset = 0;
-        while (!stop_requested() && offset < packet.data.size()) {
-            const std::size_t remaining = packet.data.size() - offset;
-            const std::size_t chunk = std::min<std::size_t>(remaining, kMaxStreamChunkBytes);
-
-            std::memcpy(stream_vir_addr_, packet.data.data() + offset, chunk);
-
-            AX_VDEC_STREAM_T stream{};
-            stream.u64PTS = packet.pts;
-            stream.bEndOfFrame = (offset + chunk) >= packet.data.size() ? AX_TRUE : AX_FALSE;
-            stream.bEndOfStream = AX_FALSE;
-            stream.bSkipDisplay = AX_FALSE;
-            stream.u32StreamPackLen = static_cast<AX_U32>(chunk);
-            stream.pu8Addr = stream_vir_addr_;
-            stream.u64PhyAddr = stream_phy_addr_;
-
-            while (!stop_requested()) {
-                const auto ret = AX_VDEC_SendStream(group_, &stream, kAxWaitMs);
-                if (ret == AX_SUCCESS) {
-                    break;
-                }
-                if (ret != AX_ERR_VDEC_BUF_FULL && ret != AX_ERR_VDEC_QUEUE_FULL) {
-                    std::fprintf(stderr,
-                                 "ax650 SendEncodedPacket: AX_VDEC_SendStream grp=%d ret=0x%x pts=%llu len=%u eof=%d\n",
-                                 group_, ret, static_cast<unsigned long long>(stream.u64PTS), stream.u32StreamPackLen,
-                                 stream.bEndOfFrame);
-                    return false;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-
-            offset += chunk;
+        if (packet.data.size() > stream_buffer_size_) {
+            std::fprintf(stderr, "ax650 SendEncodedPacket: packet too large: %zu > stream_buf=%u\n",
+                         packet.data.size(), stream_buffer_size_);
+            return false;
         }
 
-        return offset >= packet.data.size() && !stop_requested();
+        // FRAME mode expects one access unit per SendStream call with bEndOfFrame=AX_TRUE.
+        std::memcpy(stream_vir_addr_, packet.data.data(), packet.data.size());
+        // Ensure VDEC can see the latest bytes. Some firmwares/platform configs return cached CMM here.
+        (void)AX_SYS_MflushCache(stream_phy_addr_, stream_vir_addr_, static_cast<AX_U32>(packet.data.size()));
+
+        AX_VDEC_STREAM_T stream{};
+        stream.u64PTS = packet.pts;
+        stream.bEndOfFrame = AX_TRUE;
+        stream.bEndOfStream = AX_FALSE;
+        stream.bSkipDisplay = AX_FALSE;
+        stream.u32StreamPackLen = static_cast<AX_U32>(packet.data.size());
+        stream.pu8Addr = stream_vir_addr_;
+        // Follow MSP samples: use virtual address only.
+        // Some firmware versions behave incorrectly if u64PhyAddr is provided here.
+        stream.u64PhyAddr = 0;
+
+        while (!stop_requested()) {
+            const auto ret = AX_VDEC_SendStream(group_, &stream, kAxWaitMs);
+            if (ret == AX_SUCCESS) {
+                return true;
+            }
+            if (ret != AX_ERR_VDEC_BUF_FULL && ret != AX_ERR_VDEC_QUEUE_FULL) {
+                std::fprintf(stderr,
+                             "ax650 SendEncodedPacket: AX_VDEC_SendStream grp=%d ret=0x%x pts=%llu len=%u eof=%d\n",
+                             group_, ret, static_cast<unsigned long long>(stream.u64PTS), stream.u32StreamPackLen,
+                             stream.bEndOfFrame);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        return false;
     }
 
     bool SendEndOfStream() override {

@@ -12,6 +12,7 @@
 
 #include "ax_image_copy.h"
 #include "ax_image_internal.h"
+#include "ax_ivps_lock.h"
 #include "common/ax_system.h"
 
 namespace axvsdk::common::internal {
@@ -165,13 +166,92 @@ AX_IVPS_ASPECT_RATIO_ALIGN_E ToVerticalAlign(ResizeAlign align) noexcept {
     }
 }
 
+// RGB(0xRRGGBB) -> YUV components for 20e IVPS background color.
+void RgbToYuv(std::uint32_t rgb, std::uint8_t* y, std::uint8_t* u, std::uint8_t* v) noexcept;
+
+AX_U32 PackYuvColorFromRgb(std::uint32_t rgb) noexcept {
+    std::uint8_t y = 0;
+    std::uint8_t u = 128;
+    std::uint8_t v = 128;
+    RgbToYuv(rgb, &y, &u, &v);
+    return (static_cast<AX_U32>(y) << 16U) | (static_cast<AX_U32>(u) << 8U) | static_cast<AX_U32>(v);
+}
+
+AX_U32 AlignDownEven(AX_U32 v) noexcept {
+    return (v & 1U) ? (v - 1U) : v;
+}
+
+AX_IVPS_ASPECT_RATIO_T MakeKeepAspectRatioManual(const ImageProcessRequest& request,
+                                                 AX_U32 src_w,
+                                                 AX_U32 src_h,
+                                                 AX_U32 dst_w,
+                                                 AX_U32 dst_h) noexcept {
+    AX_IVPS_ASPECT_RATIO_T aspect_ratio{};
+    aspect_ratio.eMode = AX_IVPS_ASPECT_RATIO_MANUAL;
+    aspect_ratio.eAligns[0] = ToHorizontalAlign(request.resize.horizontal_align);
+    aspect_ratio.eAligns[1] = ToVerticalAlign(request.resize.vertical_align);
+    aspect_ratio.nBgColor = PackYuvColorFromRgb(request.resize.background_color);
+
+    if (src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) {
+        aspect_ratio.tRect.nX = 0;
+        aspect_ratio.tRect.nY = 0;
+        aspect_ratio.tRect.nW = 0;
+        aspect_ratio.tRect.nH = 0;
+        return aspect_ratio;
+    }
+
+    // Compute the letterbox rect deterministically (avoid IVPS AUTO inconsistencies across MSP versions).
+    AX_U32 resized_w = 0;
+    AX_U32 resized_h = 0;
+    const std::uint64_t lhs = static_cast<std::uint64_t>(src_w) * static_cast<std::uint64_t>(dst_h);
+    const std::uint64_t rhs = static_cast<std::uint64_t>(src_h) * static_cast<std::uint64_t>(dst_w);
+    if (lhs >= rhs) {
+        // Width-limited.
+        resized_w = dst_w;
+        resized_h = static_cast<AX_U32>((static_cast<std::uint64_t>(src_h) * dst_w) / src_w);
+    } else {
+        // Height-limited.
+        resized_h = dst_h;
+        resized_w = static_cast<AX_U32>((static_cast<std::uint64_t>(src_w) * dst_h) / src_h);
+    }
+
+    resized_w = std::max<AX_U32>(1, std::min(resized_w, dst_w));
+    resized_h = std::max<AX_U32>(1, std::min(resized_h, dst_h));
+
+    // NV12 needs even rect size/offset to keep UV aligned; safe for RGB/BGR too.
+    resized_w = std::max<AX_U32>(2, AlignDownEven(resized_w));
+    resized_h = std::max<AX_U32>(2, AlignDownEven(resized_h));
+
+    const AX_U32 pad_w = dst_w - resized_w;
+    const AX_U32 pad_h = dst_h - resized_h;
+
+    auto AlignOffset = [](AX_U32 pad, ResizeAlign a) -> AX_U32 {
+        switch (a) {
+        case ResizeAlign::kStart:
+            return 0;
+        case ResizeAlign::kEnd:
+            return pad;
+        case ResizeAlign::kCenter:
+        default:
+            return pad / 2U;
+        }
+    };
+
+    aspect_ratio.tRect.nX = AlignOffset(pad_w, request.resize.horizontal_align);
+    aspect_ratio.tRect.nY = AlignOffset(pad_h, request.resize.vertical_align);
+    aspect_ratio.tRect.nW = resized_w;
+    aspect_ratio.tRect.nH = resized_h;
+    return aspect_ratio;
+}
+
 AX_IVPS_ASPECT_RATIO_T MakeAspectRatio(const ImageProcessRequest& request) noexcept {
     if (request.resize.mode == ResizeMode::kKeepAspectRatio) {
         AX_IVPS_ASPECT_RATIO_T aspect_ratio{};
         aspect_ratio.eMode = AX_IVPS_ASPECT_RATIO_AUTO;
         aspect_ratio.eAligns[0] = ToHorizontalAlign(request.resize.horizontal_align);
         aspect_ratio.eAligns[1] = ToVerticalAlign(request.resize.vertical_align);
-        aspect_ratio.nBgColor = request.resize.background_color;
+        // 20e MSP: nBgColor is YUV packed (Y<<16 | U<<8 | V). Request uses 0xRRGGBB.
+        aspect_ratio.nBgColor = PackYuvColorFromRgb(request.resize.background_color);
         return aspect_ratio;
     }
 
@@ -305,6 +385,9 @@ public:
             return false;
         }
 
+        // IVPS is not reliably thread-safe across MSP versions; serialize in-process.
+        std::lock_guard<std::mutex> ivps_lock(common::internal::IvpsGlobalMutex());
+
         ImageDescriptor expected_output{};
         if (!ResolveOutputDescriptor(source, request, &expected_output)) {
             std::fprintf(stderr, "ax620e image processor: resolve output descriptor failed\n");
@@ -367,7 +450,14 @@ public:
             }
 
             AX_IVPS_CROP_RESIZE_ATTR_T attr{};
-            attr.tAspectRatio = MakeAspectRatio(request);
+            if (request.resize.mode == ResizeMode::kKeepAspectRatio) {
+                const AX_U32 src_w = request.enable_crop ? request.crop.width : source.width();
+                const AX_U32 src_h = request.enable_crop ? request.crop.height : source.height();
+                attr.tAspectRatio = MakeKeepAspectRatioManual(request, src_w, src_h,
+                                                             destination.width(), destination.height());
+            } else {
+                attr.tAspectRatio = MakeStretchAspectRatio();
+            }
             attr.eSclType = AX_IVPS_SCL_TYPE_AUTO;
             attr.eSclInput = AX_IVPS_SCL_INPUT_MONOPOLY;
             attr.nAlpha = 255;
@@ -426,7 +516,14 @@ public:
         }
 
         AX_IVPS_CROP_RESIZE_ATTR_T attr{};
-        attr.tAspectRatio = MakeAspectRatio(request);
+        if (request.resize.mode == ResizeMode::kKeepAspectRatio) {
+            const AX_U32 src_w = request.enable_crop ? request.crop.width : source.width();
+            const AX_U32 src_h = request.enable_crop ? request.crop.height : source.height();
+            attr.tAspectRatio = MakeKeepAspectRatioManual(request, src_w, src_h,
+                                                         intermediate->width(), intermediate->height());
+        } else {
+            attr.tAspectRatio = MakeStretchAspectRatio();
+        }
         attr.eSclType = AX_IVPS_SCL_TYPE_AUTO;
         attr.eSclInput = AX_IVPS_SCL_INPUT_MONOPOLY;
         attr.nAlpha = 255;

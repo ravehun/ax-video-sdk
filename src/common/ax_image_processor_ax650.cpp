@@ -8,6 +8,8 @@
 #include <mutex>
 #include <vector>
 
+#include "ax_ivps_lock.h"
+
 #include "ax_ivps_api.h"
 
 #include "ax_image_internal.h"
@@ -303,6 +305,9 @@ public:
             std::fprintf(stderr, "ax650 image processor: system not ready or crop invalid\n");
             return false;
         }
+
+        // IVPS is not reliably thread-safe across MSP versions; serialize in-process.
+        std::lock_guard<std::mutex> ivps_lock(common::internal::IvpsGlobalMutex());
 
         ImageDescriptor expected_output{};
         if (!ResolveOutputDescriptor(source, request, &expected_output)) {

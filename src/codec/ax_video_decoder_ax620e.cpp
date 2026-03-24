@@ -387,9 +387,15 @@ protected:
 
         AX_VDEC_STREAM_T stream{};
         // IMPORTANT:
-        // Some 20e firmwares behave poorly when input PTS is non-monotonic (MP4 with B-frames has out-of-order PTS in
-        // decode order). Follow MSP samples: always feed a monotonic PTS in microseconds.
-        stream.u64PTS = next_pts_us_;
+        // For MP4/H.264 with B-frames, feeding decode-order timestamps (or synthetic monotonic PTS) can cause
+        // visible "flashback"/jitter because VDEC may rely on per-access-unit PTS to output display order.
+        // The pipeline demuxer already normalizes MP4 timestamps to microseconds.
+        //
+        // If upstream does not provide PTS (always 0), fall back to a monotonic cursor similar to MSP samples.
+        stream.u64PTS = packet.pts;
+        if (stream.u64PTS == 0 && next_pts_us_ != 0) {
+            stream.u64PTS = next_pts_us_;
+        }
         stream.bEndOfFrame = AX_TRUE;
         stream.bEndOfStream = AX_FALSE;
         stream.bSkipDisplay = AX_FALSE;
@@ -455,21 +461,6 @@ protected:
     bool SendEndOfStream() override {
         if (group_ < 0) {
             return false;
-        }
-
-        // Give VDEC a chance to drain queued access units before signaling EOS.
-        // Without this, some 20e firmware versions may stop early for file sources that are fed too fast.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (!stop_requested()) {
-            const auto submitted = submitted_frames_.load(std::memory_order_relaxed);
-            const auto received = received_frames_.load(std::memory_order_relaxed);
-            if (received >= submitted) {
-                break;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         AX_VDEC_STREAM_T stream{};

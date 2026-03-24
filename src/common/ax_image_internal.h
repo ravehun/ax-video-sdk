@@ -20,6 +20,8 @@ struct AxImageAccess {
     static const AX_VIDEO_FRAME_T& GetAxFrame(const AxImage& image) noexcept;
     static AX_VIDEO_FRAME_T* MutableAxFrame(AxImage* image) noexcept;
     static void AttachLifetime(AxImage* image, std::shared_ptr<void> lifetime) noexcept;
+    // Copy timing / crop metadata but do not touch addresses/strides/block ids.
+    static void CopyFrameMetadata(const AxImage& source, AxImage* destination) noexcept;
 };
 
 }  // namespace axvsdk::common::internal

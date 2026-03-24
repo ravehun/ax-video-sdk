@@ -15,6 +15,7 @@
 #include "codec/ax_video_decoder.h"
 #include "codec/ax_video_encoder.h"
 #include "ax_image_copy.h"
+#include "ax_image_internal.h"
 #include "ax_drawer_internal.h"
 #include "common/ax_drawer.h"
 #include "common/ax_image.h"
@@ -62,6 +63,18 @@ std::size_t MinStride(common::PixelFormat format, std::uint32_t width, std::size
     default:
         return 0;
     }
+}
+
+bool SameDescriptor(const common::ImageDescriptor& a, const common::ImageDescriptor& b) noexcept {
+    if (a.format != b.format || a.width != b.width || a.height != b.height) {
+        return false;
+    }
+    for (std::size_t i = 0; i < common::kMaxImagePlanes; ++i) {
+        if (a.strides[i] != b.strides[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool AllStridesUnset(const common::ImageDescriptor& descriptor) noexcept {
@@ -171,6 +184,7 @@ public:
             input_stream.width == 0 || input_stream.height == 0) {
             return false;
         }
+        input_stream_ = input_stream;
 
         auto decoder = codec::CreateVideoDecoder();
         if (!decoder) {
@@ -310,6 +324,10 @@ public:
             FanoutFrame(std::move(frame));
         }, codec::FrameCallbackMode::kQueue);
         return true;
+    }
+
+    codec::VideoStreamInfo GetInputStreamInfo() const noexcept override {
+        return input_stream_;
     }
 
     void Close() noexcept override {
@@ -461,6 +479,12 @@ public:
             return nullptr;
         }
 
+        // Zero-copy fast path: when no format/geometry/stride change is requested, return the source frame directly.
+        // The returned shared_ptr keeps the underlying buffer alive and does not block the decode thread.
+        if (SameDescriptor(output_descriptor, source_frame->descriptor())) {
+            return source_frame;
+        }
+
         common::ImageProcessRequest request{};
         request.output_image = output_descriptor;
         request.resize = config_.frame_output.resize;
@@ -569,6 +593,7 @@ private:
             return nullptr;
         }
 
+        common::internal::AxImageAccess::CopyFrameMetadata(source, output.get());
         return output;
     }
 
@@ -600,7 +625,7 @@ private:
         active_osd_remaining_frames_ = active_osd_->hold_frames();
     }
 
-    bool ApplyOsdIfNeeded(common::AxImage::Ptr* frame) {
+    bool ApplyOsdIfNeeded(const common::AxImage* source_frame, common::AxImage::Ptr* frame) {
         if (frame == nullptr || !*frame) {
             return false;
         }
@@ -622,13 +647,22 @@ private:
             }
         }
 
-        auto osd_frame = CreateOutputImage((*frame)->descriptor());
-        if (!osd_frame || !common::internal::CopyImage(**frame, osd_frame.get())) {
-            std::fprintf(stderr, "pipeline osd: copy frame failed\n");
-            return false;
+        // If the encoder frame aliases the source frame that we publish to callbacks/GetLatestFrame,
+        // avoid drawing in-place by materializing a CMM copy first. If upstream already provided a
+        // dedicated encoder buffer (e.g. AX650 pool->CMM canonicalization), draw in-place to avoid
+        // an extra full-frame copy.
+        common::AxImage::Ptr target = *frame;
+        if (source_frame != nullptr && target.get() == source_frame) {
+            auto osd_frame = CreateOutputImage(target->descriptor());
+            if (!osd_frame || !common::internal::CopyImage(*target, osd_frame.get())) {
+                std::fprintf(stderr, "pipeline osd: copy frame failed\n");
+                return false;
+            }
+            common::internal::AxImageAccess::CopyFrameMetadata(*target, osd_frame.get());
+            target = std::move(osd_frame);
         }
 
-        if (!osd_to_apply->Apply(*osd_frame)) {
+        if (!osd_to_apply->Apply(*target)) {
             std::fprintf(stderr, "pipeline osd: apply failed\n");
             return false;
         }
@@ -640,7 +674,7 @@ private:
         }
 #endif
 
-        *frame = std::move(osd_frame);
+        *frame = std::move(target);
         return true;
     }
 
@@ -649,13 +683,28 @@ private:
             return;
         }
 
+        std::uint64_t packet_count = 0;
         while (!demux_stop_) {
             codec::EncodedPacket packet;
             if (!demuxer_->ReadPacket(&packet)) {
+                if (packet_count == 0) {
+                    std::fprintf(stderr, "pipeline demux: ReadPacket returned false (no packets)\n");
+                }
                 break;
             }
 
+            if (packet_count < 3) {
+                std::fprintf(stderr, "pipeline demux: pkt=%llu bytes=%zu pts=%llu dur=%llu key=%d\n",
+                             static_cast<unsigned long long>(packet_count),
+                             packet.data.size(),
+                             static_cast<unsigned long long>(packet.pts),
+                             static_cast<unsigned long long>(packet.duration),
+                             packet.key_frame ? 1 : 0);
+            }
+            ++packet_count;
+
             if (!decoder_->SubmitPacket(std::move(packet))) {
+                std::fprintf(stderr, "pipeline demux: SubmitPacket failed\n");
                 break;
             }
         }
@@ -692,6 +741,13 @@ private:
                 continue;
             }
 
+            // Zero-copy fast path: hand out the same frame when caller didn't request any conversion.
+            // This avoids per-frame CMM allocations and improves AXCL/NPU performance.
+            if (SameDescriptor(output_descriptor, source_frame->descriptor())) {
+                callback(std::move(source_frame));
+                continue;
+            }
+
             common::ImageProcessRequest request{};
             request.output_image = output_descriptor;
             request.resize = config_.frame_output.resize;
@@ -707,21 +763,39 @@ private:
             return;
         }
 
-        (void)ApplyOsdIfNeeded(&frame);
-        common::AxImage::Ptr encoder_frame = frame;
-
+        // Publish the raw decoded frame to callback/GetLatestFrame first. OSD is applied only on
+        // the encoder path to avoid mutating frames consumed by the user/NPU thread.
+        common::AxImage::Ptr source_frame = frame;
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
-            latest_source_frame_ = frame;
+            latest_source_frame_ = source_frame;
         }
-
         {
             std::lock_guard<std::mutex> lock(frame_callback_mutex_);
             if (frame_callback_) {
-                pending_callback_source_frame_ = frame;
+                pending_callback_source_frame_ = source_frame;
                 frame_callback_cv_.notify_one();
             }
         }
+
+        common::AxImage::Ptr encoder_frame = source_frame;
+
+#if defined(AXSDK_CHIP_AX650)
+        // AX650 VENC expects CMM-backed frames. Passing VDEC pool frames directly can yield chroma corruption
+        // for some streams. Canonicalize to a CMM image once per decoded frame and fan-out to all encoders.
+        if (encoder_frame && encoder_frame->memory_type() == common::MemoryType::kPool) {
+            common::ImageProcessRequest request{};
+            request.output_image = encoder_frame->descriptor();
+            auto copied = CreateFrameCopy(*encoder_frame, request);
+            if (copied) {
+                encoder_frame = std::move(copied);
+            } else {
+                std::fprintf(stderr, "pipeline: copy decoded frame to CMM failed\n");
+            }
+        }
+#endif
+
+        (void)ApplyOsdIfNeeded(source_frame.get(), &encoder_frame);
 
         for (auto& branch : branches_) {
             if (!branch.encoder->SubmitFrame(encoder_frame)) {
@@ -734,6 +808,7 @@ private:
     std::unique_ptr<Demuxer> demuxer_;
     std::unique_ptr<codec::VideoDecoder> decoder_;
     std::vector<OutputBranch> branches_;
+    codec::VideoStreamInfo input_stream_{};
     std::atomic<bool> open_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> demux_stop_{false};

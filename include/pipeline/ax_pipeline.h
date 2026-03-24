@@ -74,6 +74,9 @@ public:
     virtual bool Start() = 0;
     virtual void Stop() noexcept = 0;
 
+    // 输入流元信息（来自 demuxer）。
+    virtual codec::VideoStreamInfo GetInputStreamInfo() const noexcept = 0;
+
     // 返回值版本：
     // 返回当前“最新一帧”语义的图像。
     // 默认按 frame_output 配置生成；若未配置，通常返回 NV12 解码原图尺寸。
