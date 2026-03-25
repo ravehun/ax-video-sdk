@@ -25,16 +25,22 @@ namespace axvsdk::common::internal {
 namespace {
 
 std::size_t ByteStrideFromAxPicStride(PixelFormat format, AX_U32 pic_stride) noexcept {
+    // Convert AX u32PicStride back to bytes-per-line for our internal descriptor.
+#if defined(AXSDK_PLATFORM_AXCL)
+    // AXCL behaves as bytes-per-line for all formats.
+    (void)format;
+    return static_cast<std::size_t>(pic_stride);
+#else
     switch (format) {
     case PixelFormat::kRgb24:
     case PixelFormat::kBgr24:
-        // AX u32PicStride for RGB/BGR is in pixels.
         return static_cast<std::size_t>(pic_stride) * 3U;
     case PixelFormat::kNv12:
     case PixelFormat::kUnknown:
     default:
         return static_cast<std::size_t>(pic_stride);
     }
+#endif
 }
 
 #if defined(AXSDK_PLATFORM_AXCL)

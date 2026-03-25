@@ -71,7 +71,11 @@ bool ResolveOutputDescriptor(const AxImage& source,
     }
 
     if (descriptor->strides[0] == 0) {
-        descriptor->strides[0] = AlignUp(min_stride, kDefaultStrideAlignment);
+        const auto stride_alignment =
+            (descriptor->format == PixelFormat::kRgb24 || descriptor->format == PixelFormat::kBgr24)
+                ? (kDefaultStrideAlignment * 3U)  // 16 pixels (48 bytes) to keep RGB stride % 3 == 0.
+                : kDefaultStrideAlignment;
+        descriptor->strides[0] = AlignUp(min_stride, stride_alignment);
     }
 
     if (descriptor->format == PixelFormat::kNv12) {

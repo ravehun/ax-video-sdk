@@ -23,6 +23,7 @@
 
 #if defined(AXSDK_PLATFORM_AXCL)
 #include "axcl_rt_device.h"
+#include "axcl_rt_memory.h"
 #include "ax_system_internal.h"
 #endif
 
@@ -625,6 +626,95 @@ private:
         active_osd_remaining_frames_ = active_osd_->hold_frames();
     }
 
+    common::AxImage::Ptr AcquireOsdFrame(const common::ImageDescriptor& descriptor) {
+        std::lock_guard<std::mutex> lock(osd_pool_mutex_);
+
+        for (const auto& candidate : osd_pool_) {
+            if (!candidate) {
+                continue;
+            }
+            if (candidate.use_count() != 1) {
+                continue;  // in use by encoder path
+            }
+            if (!SameDescriptor(candidate->descriptor(), descriptor)) {
+                continue;
+            }
+            return candidate;
+        }
+
+        auto created = CreateOutputImage(descriptor);
+        if (created) {
+            osd_pool_.push_back(created);
+        }
+        return created;
+    }
+
+    bool CopyImageForOsd(const common::AxImage& source, common::AxImage* destination) {
+        if (destination == nullptr) {
+            return false;
+        }
+#if defined(AXSDK_PLATFORM_AXCL)
+        // Avoid routing full-frame copies through IVPS on AXCL: it competes with preprocess CropResize/Csc and can
+        // dramatically reduce FPS. Use runtime D2D memcpy instead.
+        if (source.format() != destination->format() ||
+            source.width() != destination->width() ||
+            source.height() != destination->height()) {
+            return false;
+        }
+        if (!common::internal::EnsureAxclThreadContext(config_.device_id)) {
+            return false;
+        }
+
+        const auto fmt = source.format();
+        const auto w = source.width();
+        const auto h = source.height();
+        const std::size_t plane_count = (fmt == common::PixelFormat::kNv12) ? 2U :
+                                        ((fmt == common::PixelFormat::kRgb24 || fmt == common::PixelFormat::kBgr24) ? 1U : 0U);
+        if (plane_count == 0 || w == 0 || h == 0) {
+            return false;
+        }
+
+        for (std::size_t plane = 0; plane < plane_count; ++plane) {
+            const auto src_phy = source.physical_address(plane);
+            const auto dst_phy = destination->physical_address(plane);
+            if (src_phy == 0 || dst_phy == 0) {
+                return false;
+            }
+
+            const std::size_t rows = (fmt == common::PixelFormat::kNv12 && plane == 1) ? (h / 2U) : h;
+            const std::size_t row_bytes =
+                (fmt == common::PixelFormat::kNv12) ? static_cast<std::size_t>(w)
+                                                    : static_cast<std::size_t>(w) * 3U;
+            const std::size_t src_stride = source.stride(plane);
+            const std::size_t dst_stride = destination->stride(plane);
+            if (rows == 0 || row_bytes == 0 || src_stride < row_bytes || dst_stride < row_bytes) {
+                return false;
+            }
+
+            const auto* src = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(src_phy));
+            auto* dst = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(dst_phy));
+
+            if (src_stride == dst_stride) {
+                const std::size_t bytes = src_stride * rows;
+                if (axclrtMemcpy(dst, src, bytes, AXCL_MEMCPY_DEVICE_TO_DEVICE) != AXCL_SUCC) {
+                    return false;
+                }
+            } else {
+                for (std::size_t r = 0; r < rows; ++r) {
+                    if (axclrtMemcpy(dst + r * dst_stride, src + r * src_stride, row_bytes,
+                                     AXCL_MEMCPY_DEVICE_TO_DEVICE) != AXCL_SUCC) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+#else
+        return common::internal::CopyImage(source, destination);
+#endif
+    }
+
     bool ApplyOsdIfNeeded(const common::AxImage* source_frame, common::AxImage::Ptr* frame) {
         if (frame == nullptr || !*frame) {
             return false;
@@ -653,8 +743,8 @@ private:
         // an extra full-frame copy.
         common::AxImage::Ptr target = *frame;
         if (source_frame != nullptr && target.get() == source_frame) {
-            auto osd_frame = CreateOutputImage(target->descriptor());
-            if (!osd_frame || !common::internal::CopyImage(*target, osd_frame.get())) {
+            auto osd_frame = AcquireOsdFrame(target->descriptor());
+            if (!osd_frame || !CopyImageForOsd(*target, osd_frame.get())) {
                 std::fprintf(stderr, "pipeline osd: copy frame failed\n");
                 return false;
             }
@@ -668,10 +758,9 @@ private:
         }
 
 #if defined(AXSDK_PLATFORM_AXCL)
-        if (!common::internal::EnsureAxclThreadContext(config_.device_id) || axclrtSynchronizeDevice() != AXCL_SUCC) {
-            std::fprintf(stderr, "pipeline osd: synchronize failed\n");
-            return false;
-        }
+        // Avoid global axclrtSynchronizeDevice() here: it can stall VDEC/VENC and collapse FPS.
+        // IVPS draw APIs are synchronous enough for the encoder submission path.
+        (void)common::internal::EnsureAxclThreadContext(config_.device_id);
 #endif
 
         *frame = std::move(target);
@@ -834,6 +923,9 @@ private:
     std::shared_ptr<const common::PreparedDrawCommands> pending_osd_;
     std::shared_ptr<const common::PreparedDrawCommands> active_osd_;
     std::uint32_t active_osd_remaining_frames_{0};
+
+    std::mutex osd_pool_mutex_;
+    std::vector<common::AxImage::Ptr> osd_pool_;
 };
 
 }  // namespace

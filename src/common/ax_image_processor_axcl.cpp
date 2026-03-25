@@ -7,6 +7,7 @@
 
 #include "axcl_ivps.h"
 #include "axcl_rt_device.h"
+#include "axcl_rt_memory.h"
 
 #include "ax_image_copy.h"
 #include "ax_image_internal.h"
@@ -67,7 +68,11 @@ bool ResolveOutputDescriptor(const AxImage& source,
     }
 
     if (descriptor->strides[0] == 0) {
-        descriptor->strides[0] = AlignUp(min_stride, kDefaultStrideAlignment);
+        const auto stride_alignment =
+            (descriptor->format == PixelFormat::kRgb24 || descriptor->format == PixelFormat::kBgr24)
+                ? (kDefaultStrideAlignment * 3U)  // 16 pixels (48 bytes) to keep RGB stride % 3 == 0.
+                : kDefaultStrideAlignment;
+        descriptor->strides[0] = AlignUp(min_stride, stride_alignment);
     }
 
     if (descriptor->format == PixelFormat::kNv12) {
@@ -214,16 +219,46 @@ public:
         }
 
         const auto aspect_ratio = MakeAspectRatio(request);
-        const AX_S32 ret =
-            (!request.enable_crop && source.width() == destination.width() && source.height() == destination.height())
-                ? AXCL_IVPS_CscVpp(&src_frame, dst_frame)
-                : AXCL_IVPS_CropResizeVpp(&src_frame, dst_frame, &aspect_ratio);
-        if (ret != AX_SUCCESS) {
-            return false;
+        const bool is_csc_only =
+            (!request.enable_crop && source.width() == destination.width() && source.height() == destination.height());
+
+        AX_S32 ret = AX_SUCCESS;
+        if (is_csc_only) {
+            // Fast path: geometry matches, only CSC is needed.
+            ret = AXCL_IVPS_CscVgp(&src_frame, dst_frame);
+            if (ret != AX_SUCCESS) {
+                return false;
+            }
+        } else {
+            // Clear destination to avoid stale garbage in padding region (letterbox).
+            const auto plane_count = destination.plane_count();
+            for (std::size_t plane = 0; plane < plane_count; ++plane) {
+                const auto phy = destination.physical_address(plane);
+                const auto sz = destination.plane_size(plane);
+                if (phy == 0 || sz == 0) {
+                    return false;
+                }
+                const std::uint8_t v = (destination.format() == PixelFormat::kNv12 && plane == 1) ? 128U : 0U;
+                if (axclrtMemset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(phy)), v, sz) != AXCL_SUCC) {
+                    return false;
+                }
+            }
+
+            // On AXCL, VGP is more reliable for crop/resize when output is packed RGB/BGR.
+            if (destination.format() == PixelFormat::kRgb24 || destination.format() == PixelFormat::kBgr24) {
+                ret = AXCL_IVPS_CropResizeVgp(&src_frame, dst_frame, &aspect_ratio);
+            } else {
+                ret = AXCL_IVPS_CropResizeVpp(&src_frame, dst_frame, &aspect_ratio);
+            }
+            if (ret != AX_SUCCESS) {
+                return false;
+            }
         }
 
         return destination.InvalidateCache() && axclrtSynchronizeDevice() == AXCL_SUCC;
     }
+
+private:
 };
 
 }  // namespace
